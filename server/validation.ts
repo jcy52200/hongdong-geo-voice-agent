@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { DEFAULT_SYSTEM_PROMPT, OPENING } from './prompt.js';
 import { modelOptionsSchema } from '../shared/model-config.js';
+import { INITIAL_INTRODUCTION_TEMPLATE } from './sales-script.js';
 // Four CRM variables are mandatory. Numbers as JSON numbers would lose leading zeros.
 export const customerSchema = z.object({
   camp: z.string().trim().min(1).max(160),
@@ -14,6 +15,8 @@ export const configSchema = z.object({
   voice: z.string().trim().min(1).max(120).regex(/^[a-zA-Z0-9_\-]+$/),
   speed: z.number().min(-50).max(100),
   extraInstructions: z.string().max(8000),
+  quickReplyEnabled: z.boolean().default(true),
+  quickReplyText: z.string().trim().min(1).max(8000).default(INITIAL_INTRODUCTION_TEMPLATE),
   systemPrompt: z.string().trim().min(20, '完整限制词至少需要20个字符').max(24000).default(DEFAULT_SYSTEM_PROMPT),
   loudness: z.number().min(-50).max(100).default(0),
   opening: z.string().trim().min(1).max(2000).default(OPENING),

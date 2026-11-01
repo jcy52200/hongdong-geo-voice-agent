@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { buildPrompt, getOpening } from './prompt.js';
 import { createSeedSession, SeedPeer, type SeedEvent } from './seed.js';
+import { buildInitialIntroduction } from './sales-script.js';
+import { consumeInitialQuickReply, createInitialQuickReplyState, type InitialQuickReplyState } from './quick-reply.js';
 import type { ControlRequest, ControlResult } from '../shared/model-config.js';
 import { Simulation } from './simulation.js';
 import { Store } from './store.js';
@@ -31,6 +33,12 @@ interface LiveCall {
   pendingTools: Map<string, unknown>;
   controls: { createdAt: string; action: string; result: string }[];
   replacementText: string;
+  quickReply: InitialQuickReplyState;
+  quickReplyAudio?: {
+    requestId: string; text: string; questionId?: string; responseId?: string;
+    ttsStarted: boolean; interrupted: boolean; fallbackInserted: boolean; completed: boolean;
+    providerTextIds: Set<string>; uncorrelatedText: boolean;
+  };
 }
 export class ControlError extends Error { constructor(message: string, public status = 409) { super(message); } }
 export class SessionManager {
@@ -48,7 +56,7 @@ export class SessionManager {
       client.send(JSON.stringify({ type: 'error', message: '请在服务端 .env 配置 SEED_API_KEY 后重启' }));
       client.close(1008); return;
     }
-    const call: LiveCall = { client, openingAudioDone: false, muted: false, partials: new Map(), pendingTools: new Map(), controls: [], replacementText: '' };
+    const call: LiveCall = { client, openingAudioDone: false, muted: false, partials: new Map(), pendingTools: new Map(), controls: [], replacementText: '', quickReply: createInitialQuickReplyState() };
     this.live.set(id, call);
     this.send(id, { type: 'session', session });
     client.on('message', (data, binary) => {
@@ -154,6 +162,10 @@ export class SessionManager {
       for (const item of items) if (typeof item.call_id === 'string') call.pendingTools.set(item.call_id, item);
     }
     if (event.type === 'session.closed') { this.finish(id); return; }
+    if (status === 'active') this.quickReplyAudioEvent(id, event);
+    if (status === 'active' && /^response\.output_(?:text|audio)\.(?:started|delta|done)$/.test(event.type)) {
+      call.quickReply.outputSeen = true;
+    }
     if (event.type === 'response.output_audio.delta' && typeof event.delta === 'string') {
       this.send(id, { type: 'audio', audio: event.delta, rate: 24000 }); return;
     }
@@ -165,6 +177,7 @@ export class SessionManager {
     if (opening) return; // No ASR/interrupt/duplicate ChatText can affect the fixed greeting.
     if (event.type === 'conversation.item.input_audio_transcription.started') {
       call.currentAsr = event.item_id || randomUUID();
+      if (status === 'active') call.quickReply.firstItemId ??= call.currentAsr;
       this.send(id, { type: 'interrupted' }); // Match official demo: drop local queued playback on user speech.
     }
     if (event.type === 'response.canceled') this.send(id, { type: 'interrupted' });
@@ -176,18 +189,90 @@ export class SessionManager {
     if (!delta && !final) return;
     const key = asr ? (event.item_id || call.currentAsr || randomUUID()) : (event.response_id || call.currentChat || randomUUID());
     if (asr) call.currentAsr = key; else call.currentChat = key;
+    if (asr && status === 'active') call.quickReply.firstItemId ??= key;
     const partialKey = `${asr ? 'asr' : 'chat'}:${key}`;
     let text = call.partials.get(partialKey) ?? '';
     if (delta) text += typeof event.delta === 'string' ? event.delta : '';
     else text = event.transcript ?? event.text ?? text;
-    if (typeof text !== 'string') return;
+    if (typeof text !== 'string') text = '';
     call.partials.set(partialKey, text);
+    const quickAudio = call.quickReplyAudio;
+    const replaceFallback = Boolean(chat && quickAudio?.fallbackInserted && quickAudio.responseId === key && !quickAudio.providerTextIds.has(key));
+    if (chat && quickAudio && text) {
+      if (typeof event.response_id === 'string' && event.response_id) quickAudio.providerTextIds.add(event.response_id);
+      else quickAudio.uncorrelatedText = true;
+    }
     if (text) this.send(id, { type: 'transcript', transcript: this.store.transcript(id, key,
-      asr ? 'AsrText' : 'ChatText', text, final, event.event_id) });
+      asr ? 'AsrText' : 'ChatText', text, final, event.event_id, replaceFallback) });
     if (final) {
+      if (asr && status === 'active') this.initialQuickReply(id, key, text);
       call.partials.delete(partialKey);
       if (asr) call.currentAsr = undefined; else call.currentChat = undefined;
     }
+  }
+  private quickReplyAudioEvent(id: string, event: SeedEvent) {
+    const call = this.live.get(id);
+    const audio = call?.quickReplyAudio;
+    if (!call || !audio) return;
+    if (event.type === 'conversation.item.input_audio_transcription.started' || event.type === 'response.canceled') {
+      if (!audio.completed && !audio.interrupted) {
+        audio.interrupted = true;
+        this.store.event(id, 'local.quick_reply.interrupted', { requestId: audio.requestId, responseId: audio.responseId, reason: event.type });
+      }
+      return;
+    }
+    if (audio.interrupted || audio.completed) return;
+    if (event.type === 'response.output_audio.started') {
+      // The official replacement example identifies its TTS as chat_tts_text.
+      // Its started response_id may be empty; delta supplies the stable ID.
+      if (event.tts_type !== 'chat_tts_text') return;
+      if (typeof event.question_id !== 'string' || !event.question_id) return;
+      if (audio.questionId && audio.questionId !== event.question_id) { audio.interrupted = true; return; }
+      audio.ttsStarted = true; audio.questionId = event.question_id;
+      return;
+    }
+    if (!audio.ttsStarted || audio.uncorrelatedText || typeof event.response_id !== 'string' || !event.response_id
+      || event.question_id !== audio.questionId) return;
+    if (event.type === 'response.output_audio.delta') {
+      if (typeof event.delta !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(event.delta)) return;
+      const bytes = Buffer.from(event.delta, 'base64');
+      if (!bytes.length || bytes.length % 2) return;
+      audio.responseId ??= event.response_id;
+      if (audio.responseId !== event.response_id || audio.providerTextIds.has(event.response_id) || audio.fallbackInserted) return;
+      audio.fallbackInserted = true;
+      this.send(id, { type: 'transcript', transcript: this.store.transcript(id, event.response_id, 'ChatText', audio.text, false, event.event_id) });
+      this.store.event(id, 'local.quick_reply.transcript', { requestId: audio.requestId, responseId: audio.responseId, source: 'replacement_tts', final: false });
+    }
+    if (event.type === 'response.output_audio.done' && audio.fallbackInserted && audio.responseId === event.response_id
+      && !audio.providerTextIds.has(event.response_id)) {
+      audio.completed = true;
+      this.send(id, { type: 'transcript', transcript: this.store.transcript(id, event.response_id, 'ChatText', audio.text, true, event.event_id) });
+      this.store.event(id, 'local.quick_reply.transcript', { requestId: audio.requestId, responseId: audio.responseId, source: 'replacement_tts', final: true });
+    }
+  }
+  private initialQuickReply(id: string, itemId: string, text: string) {
+    const call = this.live.get(id);
+    const session = this.store.session(id);
+    if (!call || !session || session.status !== 'active') return;
+    const decision = consumeInitialQuickReply(call.quickReply, itemId, text, {
+      enabled: session.configSnapshot.quickReplyEnabled !== false, muted: call.muted,
+      controlPending: Boolean(call.pendingControl), replacementPending: Boolean(call.replacementText),
+      toolPending: call.pendingTools.size > 0,
+    });
+    if (!decision) return;
+    if (!decision.trigger) {
+      this.store.event(id, 'local.quick_reply.skipped', { itemId, reason: decision.reason });
+      return;
+    }
+    const event = { type: 'speech_text_buffer.replacement.commit', event_id: randomUUID(), text: buildInitialIntroduction(session.customer, session.configSnapshot.quickReplyText) };
+    // Official replacement bypasses free-form response generation. ASR completed
+    // already means end-of-speech: do not force-commit input or cancel a response.
+    this.store.event(id, 'local.quick_reply.requested', this.redact({ itemId, reason: decision.reason, event }));
+    call.quickReplyAudio = { requestId: event.event_id, text: event.text, ttsStarted: false, interrupted: false,
+      fallbackInserted: false, completed: false, providerTextIds: new Set(), uncorrelatedText: false };
+    call.peer?.send(event);
+    // No ChatText before real matching audio. Provider output_text takes priority
+    // over the audio-only fallback and reuses its response ID to avoid duplicates.
   }
   private redact<T>(value: T): T {
     const walk = (item: any): any => {
@@ -248,6 +333,10 @@ export class SessionManager {
         expected = 'conversation.item.added'; break;
     }
     event.event_id = requestId;
+    call.quickReply.operatorControlled = true;
+    if (call.quickReplyAudio && ['greet', 'replace', 'replacement_append', 'replacement_commit', 'cancel'].includes(command.action)) {
+      call.quickReplyAudio.interrupted = true;
+    }
     this.store.event(id, 'local.control.requested', this.redact({ action: command.action, event }));
     const result: Promise<ControlResult> = expected ? new Promise((resolve, reject) => {
       const timer = setTimeout(() => {

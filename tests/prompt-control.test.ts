@@ -26,7 +26,7 @@ test('完整限制词：兼容旧设置、草稿预览不保存、持久化且�
     const imported = await (await request('/customers/import', { customers: [{ camp: '试打门窗公司', name: '测试客户', phone: '13800000000', address: '石家庄' }] })).json();
     const customer = imported.customers[0];
     const original = await (await request('/sessions', { customerId: customer.id, mode: 'simulation' })).json();
-    const draft = { ...boot.config, systemPrompt: '自定义调试规则：每次只回答一句话，然后等待客户回应，不主动报价。' };
+    const draft = { ...boot.config, systemPrompt: '自定义调试规则：每次只回答一句话，然后等待客户回应，不主动报价。', quickReplyEnabled: false, quickReplyText: '那这样老板，咱们&industry的案例我发您微信。' };
     const preview = await (await request('/prompt/preview', { customer, config: draft })).json();
     assert.ok(preview.prompt.startsWith(draft.systemPrompt));
     assert.ok(preview.prompt.includes(customer.id));
@@ -40,6 +40,8 @@ test('完整限制词：兼容旧设置、草稿预览不保存、持久化且�
     const next = await (await request('/sessions', { customerId: customer.id, mode: 'simulation' })).json();
     assert.ok(next.prompt.startsWith(draft.systemPrompt));
     assert.equal(next.configSnapshot.systemPrompt, draft.systemPrompt);
+    assert.equal(next.configSnapshot.quickReplyEnabled, false);
+    assert.equal(next.configSnapshot.quickReplyText, draft.quickReplyText);
     assert.notEqual(next.promptHash, original.promptHash);
     assert.equal(runtime.store.session(original.id)!.prompt, original.prompt);
 
@@ -47,6 +49,8 @@ test('完整限制词：兼容旧设置、草稿预览不保存、持久化且�
     assert.equal(invalid.status, 400);
     assert.equal(runtime.store.config().systemPrompt, draft.systemPrompt);
     assert.equal((await request('/prompt/preview', { customer, config: { ...draft, speed: 1000 } })).status, 400);
+    assert.equal((await request('/config', { ...draft, quickReplyText: '' }, 'PUT')).status, 400);
+    assert.equal((await request('/config', { ...draft, quickReplyEnabled: 'yes' }, 'PUT')).status, 400);
     // Reading defaults for the restore button must not mutate the live config either.
     assert.equal((await (await request('/prompt/default')).json()).opening, OPENING);
     assert.equal(runtime.store.config().systemPrompt, draft.systemPrompt);

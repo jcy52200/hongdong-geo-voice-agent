@@ -5,10 +5,13 @@ import { createHash, randomUUID } from 'node:crypto';
 import { buildPrompt, DEFAULT_SYSTEM_PROMPT, OPENING } from './prompt.js';
 import type { AgentConfig, Customer, Session, SessionStatus, Transcript } from './types.js';
 import type { CallAnalysis } from '../shared/analysis.js';
+import { INITIAL_INTRODUCTION_TEMPLATE } from './sales-script.js';
 
 export const DEFAULT_CONFIG: AgentConfig = {
   agentName: '小泓', voice: 'zh_male_m191_uranus_bigtts', speed: 0, extraInstructions: '',
   systemPrompt: DEFAULT_SYSTEM_PROMPT, loudness: 0, opening: OPENING, modelOptions: {},
+  quickReplyEnabled: true,
+  quickReplyText: INITIAL_INTRODUCTION_TEMPLATE,
 };
 type Row = Record<string, any>;
 export interface SessionQuery {
@@ -58,6 +61,7 @@ export class Store {
     // Additive migrations retain existing customers, calls and configuration.
     this.addColumns('sessions', { answered_at: 'TEXT', end_reason: 'TEXT', recording: 'TEXT' });
     this.addColumns('analysis_jobs', { error: 'TEXT', attempts: 'INTEGER NOT NULL DEFAULT 0', next_attempt: 'TEXT', updated_at: 'TEXT' });
+    this.upgradeStockPrompt();
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_answered ON sessions(answered_at);
       UPDATE sessions SET answered_at=(SELECT MIN(created_at) FROM events WHERE session_id=sessions.id AND type='session.created')
         WHERE mode='seed' AND answered_at IS NULL;
@@ -77,6 +81,25 @@ export class Store {
     for (const [name, type] of Object.entries(columns)) if (!existing.has(name)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
   }
   close() { this.db.close(); }
+  private upgradeStockPrompt() {
+    const row = this.db.prepare('SELECT value FROM settings WHERE key=?').get('agent') as Row | undefined;
+    if (!row) return;
+    const config: AgentConfig = JSON.parse(row.value);
+    if (!config.systemPrompt) return; // A missing prompt already follows the current default.
+    const hash = createHash('sha256').update(config.systemPrompt.trim()).digest('hex');
+    // Only the two shipped defaults are eligible; never overwrite an edited prompt.
+    const shippedDefaults = new Set([
+      '76b9d71b82d1736083b9c9c8212c83d53a50bc26fb55acca31b7b3512d17637b',
+      '57d875f7958a82c08d48336825810cd5b5535332d694bb4eefcb966c1197f07b',
+    ]);
+    if (!shippedDefaults.has(hash)) return;
+    this.db.exec('BEGIN');
+    try {
+      this.db.prepare('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)').run('agent_backup_2026-11-02-faq', row.value);
+      this.saveConfig({ ...config, systemPrompt: DEFAULT_SYSTEM_PROMPT });
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
   config(): AgentConfig {
     const row = this.db.prepare('SELECT value FROM settings WHERE key=?').get('agent') as Row | undefined;
     return row ? { ...DEFAULT_CONFIG, ...JSON.parse(row.value) } : { ...DEFAULT_CONFIG };
@@ -251,9 +274,11 @@ export class Store {
       id: r.id, eventId: r.event_id ?? undefined, kind: r.kind, text: r.text, final: Boolean(r.final), createdAt: r.created_at,
     }));
   }
-  transcript(id: string, key: string, kind: Transcript['kind'], text: string, final: boolean, eventId?: string): Transcript {
+  transcript(id: string, key: string, kind: Transcript['kind'], text: string, final: boolean, eventId?: string, replaceFinal = false): Transcript {
     const row = this.db.prepare('SELECT * FROM transcripts WHERE session_id=? AND provider_key=? AND kind=?').get(id, key, kind) as Row | undefined;
-    if (row?.final) return this.transcripts(id).find(t => t.id === row.id)!;
+    // Authoritative provider text may replace the known audio-only quick-reply
+    // fallback. Ordinary late deltas must never overwrite a final transcript.
+    if (row?.final && !replaceFinal) return this.transcripts(id).find(t => t.id === row.id)!;
     const transcript = { id: row?.id ?? randomUUID(), eventId, kind, text, final, createdAt: row?.created_at ?? new Date().toISOString() };
     this.db.prepare(`INSERT INTO transcripts(id,session_id,provider_key,event_id,kind,text,final,created_at)
       VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(session_id,provider_key,kind)

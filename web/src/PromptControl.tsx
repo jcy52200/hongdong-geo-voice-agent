@@ -31,7 +31,8 @@ export function PromptControl(props: Props) {
     const next = new Set(previous); if (invalid) next.add(id); else next.delete(id); return next;
   }), []);
   const validation = modelOptionsSchema.safeParse(config.modelOptions ?? {});
-  const invalid = invalidJson.size > 0 || !validation.success;
+  const invalidQuickReply = !config.quickReplyText?.trim();
+  const invalid = invalidJson.size > 0 || !validation.success || invalidQuickReply;
   const previewRequest = async () => {
     const customer = customers.find(item => item.id === customerId);
     if (!customer) return;
@@ -53,8 +54,15 @@ export function PromptControl(props: Props) {
       <div className="form-actions"><button className="button secondary" type="button" disabled={saving || restoring} onClick={() => void restore()}>恢复限制词草稿</button><button className="button primary" type="submit" disabled={saving || restoring || invalid}>{saving ? '保存中…' : '保存限制词与参数'}</button><button className="button secondary" type="button" disabled={saving || restoring || invalid} onClick={() => void onSave(true)}>保存并去试打 →</button></div>
     </div>
     <div className="tabs model-tabs" role="tablist" aria-label="限制词与模型控制">{([['parameters','模型参数'],['prompt','完整限制词'],['live','实时干预'],['request','请求预览']] as const).map(([value,label]) => <button type="button" key={value} role="tab" aria-selected={tab === value} className={tab === value ? 'active' : ''} onClick={() => setTab(value)}>{label}</button>)}</div>
-    {invalid && <div className="alert error" role="alert"><p>{invalidJson.size ? `有 ${invalidJson.size} 个 JSON 编辑框格式有误，请到模型参数中修正。` : validation.error?.issues.slice(0,3).map(issue => `${issue.path.join('.')}: ${issue.message}`).join('；')}</p></div>}
-    <section hidden={tab !== 'parameters'}><ModelSettings config={config} searchConfigured={props.searchConfigured} onChange={onChange} onInvalid={onInvalid} onError={onError} /></section>
+    {invalid && <div className="alert error" role="alert"><p>{invalidQuickReply ? '请在模型参数中填写首轮拒绝快速回复文案。' : invalidJson.size ? `有 ${invalidJson.size} 个 JSON 编辑框格式有误，请到模型参数中修正。` : validation.error?.issues.slice(0,3).map(issue => `${issue.path.join('.')}: ${issue.message}`).join('；')}</p></div>}
+    <section hidden={tab !== 'parameters'}>
+      <section className="panel"><div className="panel-heading"><h2>首轮拒绝快速回复</h2><span className="subtle-tag">新通话生效</span></div><div className="panel-body">
+        <label className="parameter-toggle"><input type="checkbox" checked={config.quickReplyEnabled !== false} onChange={event => onChange({ ...config, quickReplyEnabled: event.target.checked })} /><span><strong>启用首轮拒绝快速回复</strong><small>客户首轮简单说“不需要 / 不想了解”时，若智能体尚未开始回复，就直接播报下方介绍。首句仍完整播放；后续问题由完整限制词回答。</small></span></label>
+        <label className="field">快速回复文案<textarea rows={5} maxLength={8000} value={config.quickReplyText ?? ''} onChange={event => onChange({ ...config, quickReplyText: event.target.value })} /><small>支持 &amp;industry、&amp;address、&amp;camp、&amp;name、&amp;phone。行业与地区会自然带入；完整限制词中的 FAQ 与此文案可分别编辑。</small></label>
+        {invalidQuickReply && <p className="field-error" role="alert">请填写首轮拒绝快速回复文案。</p>}
+      </div></section>
+      <ModelSettings config={config} searchConfigured={props.searchConfigured} onChange={onChange} onInvalid={onInvalid} onError={onError} />
+    </section>
     <section hidden={tab !== 'live'}><LiveControls session={props.session} enabled={tab === 'live'} savedConfig={savedConfig} dirty={dirty} /></section>
     <section hidden={tab !== 'request'} className="panel"><div className="panel-heading"><h2>实际会话请求结构</h2><button className="button secondary" type="button" disabled={!customerId || invalid} onClick={() => void previewRequest()}>生成当前草稿请求预览</button></div><div className="panel-body"><p className="prompt-help">展示 session.create 与 extension 的字段。此操作不保存、不连接云端；密钥以服务端占位符显示。草稿更改后需重新生成预览。</p>{requestPreview ? <pre className="runtime-json">{JSON.stringify(requestPreview, null, 2)}</pre> : <p className="prompt-help">选择客户后生成请求，可检查声音、开场限制词与所有扩展参数。</p>}<a className="text-button" href={DOCUMENT_URL} target="_blank" rel="noreferrer">查看本接口官方文档 ↗</a></div></section>
     <div className="prompt-layout" hidden={tab !== 'prompt'}>
