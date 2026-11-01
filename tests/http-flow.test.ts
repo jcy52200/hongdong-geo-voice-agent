@@ -52,7 +52,7 @@ test('本地 HTTP/WS 完整流程：校验、客户导入、异号复核、记�
     const record = await (await request(`/sessions/${session.id}`)).json();
     assert.equal(record.status, 'completed');
     assert.equal(record.mode, 'simulation');
-    assert.equal(record.analysisStatus, 'pending');
+    assert.equal(record.analysisStatus, 'not_requested', '文字预演不参与真实语音的意向评估');
     assert.equal(record.transcripts.length, 11);
     assert.ok(record.transcripts.every((t: any) => t.final));
     const exported = await request(`/sessions/${session.id}/export`);
@@ -63,7 +63,7 @@ test('本地 HTTP/WS 完整流程：校验、客户导入、异号复核、记�
     assert.equal((await request(`/sessions/${session.id}/finish`, {})).status, 200, '结束幂等');
     const contracts = await (await request('/integrations/contracts')).json();
     assert.equal(contracts.dialer.implemented, false);
-    assert.equal(contracts.analysis.implemented, false);
+    assert.equal(contracts.analysis.implemented, true);
     assert.equal((await request('/not-a-route')).status, 404);
   } finally { socket?.terminate(); await runtime.close(); }
 });

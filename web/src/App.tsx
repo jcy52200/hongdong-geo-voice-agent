@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, messageOf } from './api';
 import { LocalAudio } from './audio';
 import { PromptControl } from './PromptControl';
+import { CallRecords } from './CallRecords';
 import type { AgentConfig, Bootstrap, Customer, ServerEvent, Session, SessionStatus, Transcript } from './types';
 
 type Page = 'voice' | 'prompt' | 'customers' | 'sessions' | 'integrations';
@@ -10,13 +11,26 @@ const pages: { id: Page; symbol: string; label: string; note?: string }[] = [
   { id: 'prompt', symbol: '≡', label: '限制词控制' },
   { id: 'customers', symbol: '▤', label: '客户资料' },
   { id: 'sessions', symbol: '☷', label: '通话记录' },
-  { id: 'integrations', symbol: '⌘', label: '系统接入', note: '预留' },
+  { id: 'integrations', symbol: '⌘', label: '系统接入', note: '拨号待接入' },
 ];
 const statusText: Record<SessionStatus, string> = { created: '等待连接', connecting: '连接中', opening: '开场播放中', active: '对话进行中', completed: '已结束', failed: '连接失败' };
 const emptyCustomer = { camp: '', name: '', phone: '', address: '', industry: '' };
 const demoCustomer = { camp: '石家庄示例机械设备有限公司', name: '王先生', phone: '13800000000', address: '河北省石家庄市', industry: '机械设备' };
 const activeStatus = (status?: SessionStatus) => Boolean(status && !['completed', 'failed'].includes(status));
 const dateText = (date: string) => new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(date));
+type PendingRecording = { sessionId: string; blob: Blob; mimeType: string; error: string };
+async function uploadCallRecording(sessionId: string, result: { blob: Blob; mimeType: string }): Promise<Session | undefined> {
+  let snapshot = await api<Session>(`/sessions/${sessionId}`);
+  for (let attempt = 0; activeStatus(snapshot.status) && attempt < 12; attempt++) {
+    await new Promise(resolve => window.setTimeout(resolve, 150));
+    snapshot = await api<Session>(`/sessions/${sessionId}`);
+  }
+  if (!snapshot.answeredAt) return undefined;
+  if (activeStatus(snapshot.status)) throw new Error('通话结束状态尚未保存，请重试保存录音。');
+  const response = await fetch(`/api/sessions/${sessionId}/recording`, { method: 'POST', headers: { 'Content-Type': result.mimeType }, body: result.blob });
+  if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.error || '录音保存失败'); }
+  return api<Session>(`/sessions/${sessionId}`);
+}
 const pageFromHash = (): Page => pages.find(item => `#${item.id}` === location.hash)?.id ?? 'voice';
 
 function Badge({ status }: { status: SessionStatus }) { return <span className={`badge status-${status}`}><i />{statusText[status]}</span>; }
@@ -55,6 +69,9 @@ export default function App() {
   const [search, setSearch] = useState('');
   const wsRef = useRef<WebSocket | null>(null);
   const audioRef = useRef<LocalAudio | null>(null);
+  const recordingOwnerRef = useRef<string | null>(null);
+  const [recordingsSaving, setRecordingsSaving] = useState(0);
+  const [failedRecordings, setFailedRecordings] = useState<PendingRecording[]>([]);
   const liveRef = useRef<Session | null>(null);
   const openingRef = useRef(true);
   const mutedRef = useRef(false);
@@ -117,14 +134,43 @@ export default function App() {
     finally { if (request === refreshGeneration.current) setLoading(false); }
   }, [applySnapshot]);
 
+  useEffect(() => {
+    if (page !== 'customers' || !data?.customers.some(customer => ['pending', 'running'].includes(customer.industryStatus ?? ''))) return;
+    const timer = window.setInterval(() => { void refresh(true); }, 3000);
+    return () => window.clearInterval(timer);
+  }, [page, refresh, data?.customers]);
+
   const release = useCallback(() => {
     if (connectionTimer.current) window.clearTimeout(connectionTimer.current);
     const ws = wsRef.current;
     wsRef.current = null;
     if (ws) { ws.onopen = null; ws.onmessage = null; ws.onclose = null; ws.onerror = null; ws.close(); }
-    audioRef.current?.close();
+    const audio = audioRef.current;
+    const sessionId = recordingOwnerRef.current;
     audioRef.current = null;
-  }, []);
+    recordingOwnerRef.current = null;
+    if (audio) {
+      const recording = audio.stopRecording();
+      audio.close();
+      if (sessionId) {
+        setRecordingsSaving(count => count + 1);
+        void recording.then(async result => {
+          if (!result) {
+            if (audio.recordingError && liveRef.current?.id === sessionId) setNotice(audio.recordingError);
+            return;
+          }
+          try {
+            const saved = await uploadCallRecording(sessionId, result);
+            if (saved) saveSessionHistory(saved);
+          } catch (reason) {
+            const error = messageOf(reason);
+            setFailedRecordings(items => [...items.filter(item => item.sessionId !== sessionId), { sessionId, ...result, error }]);
+          }
+        }).catch(reason => setError(`录音未保存：${messageOf(reason)}`))
+          .finally(() => setRecordingsSaving(count => count - 1));
+      }
+    }
+  }, [saveSessionHistory]);
 
   useEffect(() => {
     void refresh();
@@ -149,6 +195,28 @@ export default function App() {
   const inProgress = busy || connected;
   const filterText = search.trim().toLowerCase();
   const filteredCustomers = data?.customers.filter(item => `${item.camp} ${item.name} ${item.phone} ${item.address}`.toLowerCase().includes(filterText)) ?? [];
+
+  useEffect(() => {
+    const guard = (event: BeforeUnloadEvent) => {
+      if (recordingsSaving || failedRecordings.length || (audioRef.current && activeStatus(liveRef.current?.status))) { event.preventDefault(); event.returnValue = ''; }
+    };
+    window.addEventListener('beforeunload', guard);
+    return () => window.removeEventListener('beforeunload', guard);
+  }, [recordingsSaving, failedRecordings.length]);
+
+  async function retryRecording(item: PendingRecording) {
+    setFailedRecordings(items => items.filter(row => row.sessionId !== item.sessionId));
+    setRecordingsSaving(count => count + 1);
+    try { const saved = await uploadCallRecording(item.sessionId, item); if (saved) saveSessionHistory(saved); }
+    catch (reason) { setFailedRecordings(items => [...items.filter(row => row.sessionId !== item.sessionId), { ...item, error: messageOf(reason) }]); }
+    finally { setRecordingsSaving(count => count - 1); }
+  }
+  function downloadPendingRecording(item: PendingRecording) {
+    const url = URL.createObjectURL(item.blob); const anchor = document.createElement('a');
+    const extension = item.mimeType.includes('mp4') ? 'm4a' : item.mimeType.includes('ogg') ? 'ogg' : 'webm';
+    anchor.href = url; anchor.download = `call-${item.sessionId}.${extension}`; anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
 
   async function showPrompt(draft = false) {
     if (!selectedCustomer) { setError('请先添加或选择一位客户。'); return; }
@@ -177,6 +245,7 @@ export default function App() {
       created = await api<Session>('/sessions', { customerId: selectedCustomer.id, mode });
       if (run !== generation.current) { void api<Session>(`/sessions/${created.id}/finish`, {}).then(saveSessionHistory).catch(() => undefined); return; }
       updateSession(created);
+      recordingOwnerRef.current = audio ? created.id : null;
       const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/sessions/${encodeURIComponent(created.id)}`);
       wsRef.current = ws;
       const sessionId = created.id;
@@ -299,7 +368,7 @@ export default function App() {
       const result = await api<{ customers: Customer[]; imported: number }>('/customers/import', { customers });
       setData(current => current ? { ...current, customers: result.customers } : current);
       setCustomerId(current => current || result.customers[0]?.id || '');
-      setNotice(`已导入 ${result.imported} 条客户资料。`); setImportText(''); setCustomerForm(emptyCustomer);
+      setNotice(`已导入 ${result.imported} 条客户资料，缺失行业将由 DeepSeek 自动补全。`); setImportText(''); setCustomerForm(emptyCustomer);
     } catch (reason) { setError(messageOf(reason)); }
     finally { setSaving(false); }
   }
@@ -318,29 +387,24 @@ export default function App() {
     try { const result = await api<Session>(`/sessions/${session.id}`); setViewed(result); setPage('sessions'); }
     catch (reason) { setError(messageOf(reason)); }
   }
-  async function exportSession(session: Session) {
-    try {
-      const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/export`);
-      if (!response.ok) throw new Error('导出失败，请稍后重试。');
-      const url = URL.createObjectURL(await response.blob());
-      const anchor = document.createElement('a'); anchor.href = url; anchor.download = `call-${session.id}.json`; anchor.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-    } catch (reason) { setError(messageOf(reason)); }
-  }
+
 
   return <div className="app-shell">
     <aside className="sidebar"><a className="brand" href="#voice" onClick={event => { event.preventDefault(); setPage('voice'); }}><div className="brand-mark">泓</div><div><strong>泓动引擎</strong><span>AI 销售工作台</span></div></a>
       <div className="nav-section-label">工作空间</div><nav aria-label="主导航">{pages.map(item => <button key={item.id} className={`nav-item ${page === item.id ? 'selected' : ''}`} onClick={() => { setPage(item.id); setSearch(''); }}><span className="nav-symbol" aria-hidden="true">{item.symbol}</span>{item.label}{item.note && <small>{item.note}</small>}</button>)}</nav>
-      <div className="sidebar-flow"><span>项目实施进度</span><div><i className="flow-done" />语音智能体<span>当前阶段</span></div><div><i />拨号系统<span>待接入</span></div><div><i />意向分析<span>待接入</span></div></div>
+      <div className="sidebar-flow"><span>项目实施进度</span><div><i className="flow-done" />语音智能体<span>已实现</span></div><div><i />拨号系统<span>待接入</span></div><div><i className="flow-done" />意向分析<span>已实现</span></div></div>
       <div className="sidebar-footer"><span className="local-dot" />本地工作空间<small>数据保存在本机</small></div>
     </aside>
     <div className="main-shell"><header className="topbar"><div className="breadcrumb">工作空间<span>/</span><strong>{pages.find(item => item.id === page)?.label}</strong></div><div className="topbar-right"><span className="local-label">LOCAL</span><span>泓动引擎</span><span className="user-avatar">泓</span></div></header>
       <main className="main-content">
-        <div className="page-heading"><div><h1>{page === 'voice' ? '模拟电话' : page === 'prompt' ? '限制词控制' : page === 'customers' ? '客户资料' : page === 'sessions' ? '通话记录' : '系统接入'}</h1><p>{page === 'voice' ? '您扮演客户，与销售智能体进行一通实时语音电话。' : page === 'prompt' ? '调整模型参数与限制词，连接模拟电话后可实时干预回复。' : page === 'customers' ? '导入客户列表，为每通对话生成独立的客户上下文。' : page === 'sessions' ? '逐通查看客户原话、智能体回复与提示词快照。' : '以独立会话为边界，连接拨号、语音和后续意向分析。'}</p></div><button className="button secondary" onClick={() => void refresh()} disabled={loading}>{loading ? '刷新中…' : '↻ 刷新数据'}</button></div>
+        <div className="page-heading"><div><h1>{page === 'voice' ? '模拟电话' : page === 'prompt' ? '限制词控制' : page === 'customers' ? '客户资料' : page === 'sessions' ? '通话记录' : '系统接入'}</h1><p>{page === 'voice' ? '您扮演客户，与销售智能体进行一通实时语音电话。' : page === 'prompt' ? '调整模型参数与限制词，连接模拟电话后可实时干预回复。' : page === 'customers' ? '导入客户列表，为每通对话生成独立的客户上下文。' : page === 'sessions' ? '筛选已接通电话，查看意向评估、逐句对话和原始录音。' : '以独立会话为边界，连接拨号、语音和后续意向分析。'}</p></div><button className="button secondary" onClick={() => void refresh()} disabled={loading}>{loading ? '刷新中…' : '↻ 刷新数据'}</button></div>
         {error && <div className="alert error" role="alert"><span>!</span><p>{error}</p><button aria-label="关闭错误提示" onClick={() => setError('')}>×</button></div>}
+        {failedRecordings.map(item => <div className="alert error" role="alert" key={item.sessionId}><p>录音保存失败（{item.sessionId.slice(0, 8)}）：{item.error}。音频仍保留在本页，请重试保存或先下载备份。</p><button className="text-button" onClick={() => void retryRecording(item)}>重试保存</button><button className="text-button" onClick={() => downloadPendingRecording(item)}>下载备份</button></div>)}
+        {recordingsSaving > 0 && <div className="alert" role="status"><p>正在保存 {recordingsSaving} 通录音，请保持页面打开。</p></div>}
         {notice && <div className="alert success" role="status"><span>✓</span><p>{notice}</p><button aria-label="关闭提示" onClick={() => setNotice('')}>×</button></div>}
         {loading && !data ? <div className="loading-layout" aria-label="正在加载工作台"><div /><div /><div /></div> : !data ? <div className="panel"><Empty title="暂时无法连接本地服务" detail="请确认后端已启动，然后点击刷新数据。" /></div> : <>
           {page === 'voice' && <>
-            <div className="overview-strip"><div><span className="overview-icon">▤</span><div><small>可测试客户</small><strong>{data.customers.length}<em>位</em></strong></div></div><div><span className="overview-icon">☷</span><div><small>已保存会话</small><strong>{data.sessions.length}<em>通</em></strong></div></div><div className="provider-overview"><span className={`provider-light ${data.provider.configured ? 'ready' : ''}`} /><div><small>SeedDuplex 语音服务</small><strong className="provider-value">{data.provider.configured ? '已配置密钥' : '待配置 API Key'}</strong></div><span className="subtle-tag">{data.provider.model}</span></div></div>
+            <div className="overview-strip"><div><span className="overview-icon">▤</span><div><small>可测试客户</small><strong>{data.customers.length}<em>位</em></strong></div></div><div><span className="overview-icon">☷</span><div><small>已保存会话</small><strong>{data.sessionTotal ?? data.sessions.length}<em>通</em></strong></div></div><div className="provider-overview"><span className={`provider-light ${data.provider.configured ? 'ready' : ''}`} /><div><small>SeedDuplex 语音服务</small><strong className="provider-value">{data.provider.configured ? '已配置密钥' : '待配置 API Key'}</strong></div><span className="subtle-tag">{data.provider.model}</span></div></div>
             <div className="call-intro"><div><strong>像接电话一样，测试真实对话</strong><p>选择客户 → 点击开始模拟电话 → 允许麦克风并扮演客户。AI 会先完整说完开场白。</p></div><button className="button secondary" onClick={() => setPage('prompt')}>编辑限制词 →</button></div>
             {config && JSON.stringify(config) !== JSON.stringify(data.config) && <div className="alert prompt-draft-notice"><p>限制词或模型参数有未保存修改，试打将沿用已保存版本。</p><button className="text-button" onClick={() => setPage('prompt')}>去保存 →</button></div>}
             <div className="workbench-grid"><section className="panel test-settings"><div className="panel-heading"><h2>模拟电话设置</h2><span className="subtle-tag">单通隔离</span></div><div className="panel-body"><label className="field">客户资料<select value={customerId} onChange={event => setCustomerId(event.target.value)} disabled={inProgress}><option value="" disabled>请选择客户</option>{data.customers.map(customer => <option key={customer.id} value={customer.id}>{customer.name} · {customer.camp}</option>)}</select></label>
@@ -363,13 +427,13 @@ export default function App() {
 
           {page === 'prompt' && config && <PromptControl session={live} searchConfigured={Boolean(data.provider.webSearchConfigured)} config={config} savedConfig={data.config} customers={data.customers} customerId={customerId} saving={saving} onChange={setConfig} onCustomerChange={setCustomerId} onSave={saveConfig} onPreview={() => showPrompt(true)} onError={setError} />}
 
-          {page === 'customers' && <><div className="customer-import-grid"><form className="panel" onSubmit={event => { event.preventDefault(); void importCustomers([{ ...customerForm, id: crypto.randomUUID() }]); }}><div className="panel-heading"><h2>添加客户</h2><button type="button" className="text-button" onClick={() => setCustomerForm(demoCustomer)}>填入示例</button></div><div className="panel-body"><div className="two-fields"><label className="field">公司名称 <em>*</em><input required value={customerForm.camp} onChange={event => setCustomerForm({ ...customerForm, camp: event.target.value })} placeholder="客户公司全称" /></label><label className="field">客户姓名 <em>*</em><input required value={customerForm.name} onChange={event => setCustomerForm({ ...customerForm, name: event.target.value })} placeholder="例如：王先生" /></label><label className="field">客户电话 <em>*</em><input required type="tel" value={customerForm.phone} onChange={event => setCustomerForm({ ...customerForm, phone: event.target.value })} placeholder="手机或固定电话" /></label><label className="field">客户地址 <em>*</em><input required value={customerForm.address} onChange={event => setCustomerForm({ ...customerForm, address: event.target.value })} placeholder="省 / 市 / 区域" /></label></div><label className="field">所属行业 <span className="optional">选填</span><input value={customerForm.industry} onChange={event => setCustomerForm({ ...customerForm, industry: event.target.value })} placeholder="用于更准确地讲解行业案例" /></label><button className="button primary" disabled={saving} type="submit">{saving ? '保存中…' : '添加到客户列表'}</button></div></form><section className="panel"><div className="panel-heading"><h2>批量导入 JSON</h2><label className="text-button file-picker">选择文件<input type="file" accept=".json,application/json" onChange={event => { const file = event.target.files?.[0]; if (file) void file.text().then(setImportText).catch(reason => setError(messageOf(reason))); event.target.value = ''; }} /></label></div><div className="panel-body"><label className="field"><span>客户列表</span><textarea className="mono import-text" rows={8} placeholder={'[\n  {\n    "camp": "客户公司",\n    "name": "王先生",\n    "phone": "13800000000",\n    "address": "河北省石家庄市"\n  }\n]'} value={importText} onChange={event => setImportText(event.target.value)} /></label><div className="form-actions"><button className="button secondary" disabled={saving || !importText.trim()} onClick={parseImport}>{saving ? '导入中…' : '校验并导入'}</button><small>支持数组或 {`{ customers: […] }`} 格式</small></div></div></section></div><div className="section-heading"><h2>客户列表 <span className="count">{data.customers.length}</span></h2><input className="search-input" aria-label="搜索客户" value={search} onChange={event => setSearch(event.target.value)} placeholder="搜索姓名、公司或电话" /></div><section className="panel">{filteredCustomers.length ? <div className="table-wrap"><table><thead><tr><th>公司名称</th><th>客户姓名</th><th>客户电话</th><th>地址 / 行业</th><th /></tr></thead><tbody>{filteredCustomers.map(customer => <tr key={customer.id}><td><strong>{customer.camp}</strong></td><td>{customer.name}</td><td className="mono">{customer.phone}</td><td>{customer.address}<small>{customer.industry || '行业未指定'}</small></td><td><button className="text-button" disabled={inProgress} onClick={() => { setCustomerId(customer.id); setPage('voice'); }}>带入测试 →</button></td></tr>)}</tbody></table></div> : <Empty title={search ? '没有匹配的客户' : '添加第一位客户'} detail={search ? '尝试搜索其他姓名、公司或电话。' : '手动添加一位客户，或导入 CRM 导出的 JSON 列表。'} />}</section></>}
+          {page === 'customers' && <><section className="panel"><div className="panel-heading"><div className="heading-with-subtitle"><h2>行业自动补全</h2><span>{data.analysis?.configured ? 'DeepSeek 4.1 Flash 已配置' : '在 .env 填写 DEEPSEEK_API_KEY 并重启后，将继续处理待补全客户'}</span></div><div className="form-actions"><button className="button secondary small" onClick={() => { void api('/customers/enrich', { retryFailed: true }).then(() => { setNotice('已将缺失行业和失败任务加入补全队列。'); void refresh(true); }).catch(reason => setError(messageOf(reason))); }}>补全缺失行业 / 重试</button><a className="button secondary small" href="/api/customers/export" download="customers.json">导出客户 JSON</a></div></div><div className="panel-body"><p className="body-muted">按公司名称判断行业，无法确定时填“未知”。手动填写的行业优先保留，新通话自动带入 &amp;industry。待补全 {data.analysis?.industryPending ?? 0} 条。</p></div></section><div className="customer-import-grid"><form className="panel" onSubmit={event => { event.preventDefault(); void importCustomers([{ ...customerForm, id: crypto.randomUUID() }]); }}><div className="panel-heading"><h2>添加客户</h2><button type="button" className="text-button" onClick={() => setCustomerForm(demoCustomer)}>填入示例</button></div><div className="panel-body"><div className="two-fields"><label className="field">公司名称 <em>*</em><input required value={customerForm.camp} onChange={event => setCustomerForm({ ...customerForm, camp: event.target.value })} placeholder="客户公司全称" /></label><label className="field">客户姓名 <em>*</em><input required value={customerForm.name} onChange={event => setCustomerForm({ ...customerForm, name: event.target.value })} placeholder="例如：王先生" /></label><label className="field">客户电话 <em>*</em><input required type="tel" value={customerForm.phone} onChange={event => setCustomerForm({ ...customerForm, phone: event.target.value })} placeholder="手机或固定电话" /></label><label className="field">客户地址 <em>*</em><input required value={customerForm.address} onChange={event => setCustomerForm({ ...customerForm, address: event.target.value })} placeholder="省 / 市 / 区域" /></label></div><label className="field">所属行业 <span className="optional">选填</span><input value={customerForm.industry} onChange={event => setCustomerForm({ ...customerForm, industry: event.target.value })} placeholder="用于更准确地讲解行业案例" /></label><button className="button primary" disabled={saving} type="submit">{saving ? '保存中…' : '添加到客户列表'}</button></div></form><section className="panel"><div className="panel-heading"><h2>批量导入 JSON</h2><label className="text-button file-picker">选择文件<input type="file" accept=".json,application/json" onChange={event => { const file = event.target.files?.[0]; if (file) void file.text().then(setImportText).catch(reason => setError(messageOf(reason))); event.target.value = ''; }} /></label></div><div className="panel-body"><label className="field"><span>客户列表</span><textarea className="mono import-text" rows={8} placeholder={'[\n  {\n    "camp": "客户公司",\n    "name": "王先生",\n    "phone": "13800000000",\n    "address": "河北省石家庄市"\n  }\n]'} value={importText} onChange={event => setImportText(event.target.value)} /></label><div className="form-actions"><button className="button secondary" disabled={saving || !importText.trim()} onClick={parseImport}>{saving ? '导入中…' : '校验并导入'}</button><small>支持数组或 {`{ customers: […] }`} 格式</small></div></div></section></div><div className="section-heading"><h2>客户列表 <span className="count">{data.customers.length}</span></h2><input className="search-input" aria-label="搜索客户" value={search} onChange={event => setSearch(event.target.value)} placeholder="搜索姓名、公司或电话" /></div><section className="panel">{filteredCustomers.length ? <div className="table-wrap"><table><thead><tr><th>公司名称</th><th>客户姓名</th><th>客户电话</th><th>地址 / 行业</th><th /></tr></thead><tbody>{filteredCustomers.map(customer => <tr key={customer.id}><td><strong>{customer.camp}</strong></td><td>{customer.name}</td><td className="mono">{customer.phone}</td><td>{customer.address}<small>{customer.industry || (customer.industryStatus === 'failed' ? '补全失败，可重试' : customer.industryStatus === 'running' ? '正在分析行业…' : '待补全行业')}{customer.industryError && <span title={customer.industryError}> · !</span>}</small></td><td><button className="text-button" disabled={inProgress} onClick={() => { setCustomerId(customer.id); setPage('voice'); }}>带入测试 →</button></td></tr>)}</tbody></table></div> : <Empty title={search ? '没有匹配的客户' : '添加第一位客户'} detail={search ? '尝试搜索其他姓名、公司或电话。' : '手动添加一位客户，或导入 CRM 导出的 JSON 列表。'} />}</section></>}
 
-          {page === 'sessions' && <>{viewed ? <><div className="record-toolbar"><button className="text-button" onClick={() => setViewed(null)}>← 返回全部记录</button><div><button className="button secondary small" onClick={() => setPreview({ prompt: viewed.prompt, opening: '' })}>提示词快照</button><button className="button secondary small" onClick={() => void exportSession(viewed)}>导出 JSON</button></div></div><section className="panel record-detail"><div className="panel-heading"><div className="heading-with-subtitle"><h2>{viewed.customer.name} · {viewed.customer.camp}</h2><span>{dateText(viewed.createdAt)} · {viewed.mode === 'seed' ? 'SeedDuplex 语音' : '规则文字模拟'} · {viewed.customer.phone}</span></div><Badge status={viewed.status} /></div>{viewed.error && <div className="record-error">{viewed.error}</div>}<TranscriptList transcripts={viewed.transcripts} compact /><div className="analysis-placeholder"><span>意向分析</span><p>第三板块尚未接入，当前会话未生成客户意向评分。可通过预留的分析接口消费文字记录。</p><span className="subtle-tag">待接入</span></div></section></> : <section className="panel"><div className="panel-heading"><h2>全部会话 <span className="count">{data.sessions.length}</span></h2><span className="subtle-tag">本机保存</span></div>{data.sessions.length ? <div className="table-wrap"><table><thead><tr><th>客户 / 公司</th><th>测试方式</th><th>开始时间</th><th>句数</th><th>状态</th><th>操作</th></tr></thead><tbody>{data.sessions.map(session => <tr key={session.id}><td><strong>{session.customer.name}</strong><small>{session.customer.camp}</small></td><td>{session.mode === 'seed' ? 'SeedDuplex 语音' : '规则文字模拟'}</td><td className="mono">{dateText(session.createdAt)}</td><td>{session.transcripts.length}</td><td><Badge status={session.status} /></td><td><button className="text-button" onClick={() => void openSession(session)}>查看记录 →</button></td></tr>)}</tbody></table></div> : <Empty title="还没有通话记录" detail="前往语音工作台完成一次测试，文字记录与提示词快照会自动保存。" />}</section>}</>}
+          {page === 'sessions' && <CallRecords initialSessionId={viewed?.id} onCloseDetail={() => setViewed(null)} />}
 
-          {page === 'integrations' && <><div className="integration-flow"><div><span className="integration-step">01</span><h2>拨号系统</h2><span className="badge reserved">预留接入</span><p>CRM 客户导入、任务编排、FreeSWITCH 集群与云 SIP 路线。</p></div><span className="integration-arrow">→</span><div className="current"><span className="integration-step">02</span><h2>语音智能体</h2><span className="badge status-active"><i />当前实现</span><p>SeedDuplex 实时会话、逐通客户变量、首句输入门控及文字记录。</p></div><span className="integration-arrow">→</span><div><span className="integration-step">03</span><h2>意向分析</h2><span className="badge reserved">预留接入</span><p>大语言模型分析对话、生成意向标签，交由人工继续跟进。</p></div></div><section className="panel"><div className="panel-heading"><h2>SeedDuplex 接入状态</h2><span className={`badge ${data.provider.configured ? 'status-active' : 'reserved'}`}>{data.provider.configured ? '已配置' : '待配置'}</span></div><div className="panel-body"><dl className="integration-spec"><div><dt>模型版本</dt><dd className="mono">{data.provider.model}</dd></div><div><dt>通信协议</dt><dd className="mono">{data.provider.protocol}</dd></div><div><dt>浏览器输入</dt><dd>PCM S16LE · 16 kHz · 单声道 · 20 ms / 帧</dd></div><div><dt>语音输出</dt><dd>PCM S16LE · 24 kHz · 隔离播放队列</dd></div><div><dt>会话边界</dt><dd>一位客户对应独立会话与提示词快照</dd></div></dl><a className="text-button" href="https://docs.volcengine.com/docs/doubao-voice/end-to-end-real-time-voice-full-duplex-version?lang=zh" target="_blank" rel="noreferrer">SeedDuplex 官方文档 ↗</a></div></section><section className="panel contracts-panel"><div className="panel-heading"><h2>预留接口契约</h2><button className="button secondary small" onClick={() => { void api('/integrations/contracts').then(setContracts).catch(reason => setError(messageOf(reason))); }}>读取接口契约</button></div>{contracts ? <pre className="contract-code">{JSON.stringify(contracts, null, 2)}</pre> : <div className="panel-body"><p className="body-muted">拨号侧可提供客户与通话标识，语音侧输出逐句 ASR / Chat 记录；分析侧接收已结束会话。点击读取查看后端定义的接口结构。</p></div>}</section></>}
+          {page === 'integrations' && <><div className="integration-flow"><div><span className="integration-step">01</span><h2>拨号系统</h2><span className="badge reserved">预留接入</span><p>CRM 客户导入、任务编排、FreeSWITCH 集群与云 SIP 路线。</p></div><span className="integration-arrow">→</span><div className="current"><span className="integration-step">02</span><h2>语音智能体</h2><span className="badge status-active"><i />当前实现</span><p>SeedDuplex 实时会话、逐通客户变量、首句输入门控及文字记录。</p></div><span className="integration-arrow">→</span><div><span className="integration-step">03</span><h2>意向分析</h2><span className="badge status-active">已实现</span><p>DeepSeek 4.1 Flash 自动补全行业、评估 A–G 意向等级，提取微信联系方式。</p></div></div><section className="panel"><div className="panel-heading"><h2>SeedDuplex 接入状态</h2><span className={`badge ${data.provider.configured ? 'status-active' : 'reserved'}`}>{data.provider.configured ? '已配置' : '待配置'}</span></div><div className="panel-body"><dl className="integration-spec"><div><dt>模型版本</dt><dd className="mono">{data.provider.model}</dd></div><div><dt>通信协议</dt><dd className="mono">{data.provider.protocol}</dd></div><div><dt>浏览器输入</dt><dd>PCM S16LE · 16 kHz · 单声道 · 20 ms / 帧</dd></div><div><dt>语音输出</dt><dd>PCM S16LE · 24 kHz · 隔离播放队列</dd></div><div><dt>会话边界</dt><dd>一位客户对应独立会话与提示词快照</dd></div></dl><a className="text-button" href="https://docs.volcengine.com/docs/doubao-voice/end-to-end-real-time-voice-full-duplex-version?lang=zh" target="_blank" rel="noreferrer">SeedDuplex 官方文档 ↗</a></div></section><section className="panel contracts-panel"><div className="panel-heading"><h2>预留接口契约</h2><button className="button secondary small" onClick={() => { void api('/integrations/contracts').then(setContracts).catch(reason => setError(messageOf(reason))); }}>读取接口契约</button></div>{contracts ? <pre className="contract-code">{JSON.stringify(contracts, null, 2)}</pre> : <div className="panel-body"><p className="body-muted">拨号侧可提供客户与通话标识，语音侧输出逐句 ASR / Chat 记录；分析侧接收已结束会话。点击读取查看后端定义的接口结构。</p></div>}</section></>}
         </>}
-        <footer className="main-footer"><span>泓动引擎 · 本地 AI 电话销售系统</span><span>当前阶段：语音智能体验证</span></footer>
+        <footer className="main-footer"><span>泓动引擎 · 本地 AI 电话销售系统</span><span>语音智能体与意向分析已接入</span></footer>
       </main>
     </div>
     {preview && <div className="modal-backdrop" onClick={event => { if (event.target === event.currentTarget) setPreview(null); }}><section className="prompt-modal" role="dialog" aria-modal="true" aria-labelledby="prompt-title"><div className="panel-heading"><div className="heading-with-subtitle"><h2 id="prompt-title">{preview.opening ? '本通提示词预览' : '会话提示词快照'}</h2><span>客户资料已注入，开场与对话规则随每通会话独立保存。</span></div><button className="close-button" aria-label="关闭提示词预览" autoFocus onClick={() => setPreview(null)}>×</button></div><div className="prompt-modal-body">{preview.opening && <div className="opening-preview"><strong>首句开场 · 不可打断</strong><p>{preview.opening}</p></div>}<pre>{preview.prompt}</pre></div><div className="modal-footer"><button className="button secondary" onClick={() => { void navigator.clipboard.writeText(preview.prompt).then(() => setNotice('提示词已复制。')).catch(reason => setError(messageOf(reason))); }}>复制提示词</button><button className="button primary" onClick={() => setPreview(null)}>完成</button></div></section></div>}

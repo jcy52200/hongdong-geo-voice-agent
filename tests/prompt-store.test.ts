@@ -32,7 +32,7 @@ test('固定首句逐字一致；提示词可重放，客户字符串不发生�
   assert.ok(prompt.includes(JSON.stringify({ opening: OPENING }, null, 2)));
   assert.deepEqual(customerData(prompt), {
     id: special.id, '&camp': special.camp, '&name': special.name,
-    '&phone': special.phone, '&address': special.address, industry: null,
+    '&phone': special.phone, '&address': special.address, '&industry': '待确认行业', industry: null,
   });
   assert.equal(customerData(buildPrompt({ ...special, industry: '门窗' }, config)).industry, '门窗');
   assert.notEqual(prompt, buildPrompt({ ...special, industry: '门窗' }, config));
@@ -117,7 +117,8 @@ test('同一转写从增量到最终文本只占一行，迟到增量不覆盖�
 test('完成通话仅创建一次待分析任务，不伪造 LLM 意向结果', (t) => {
   const store = new Store(':memory:');
   t.after(() => store.close());
-  const session = store.createSession(customer, 'simulation');
+  const session = store.createSession(customer, 'seed');
+  store.answered(session.id);
   assert.equal(session.analysisStatus, 'not_requested');
   store.transcript(session.id, 'turn-1', 'AsrText', '可以加微信。', true);
   store.status(session.id, 'completed');
@@ -169,6 +170,6 @@ test('重开磁盘数据库保留记录并结束遗留活动会话，避免把�
   }
   assert.equal(store.session(created.id)?.status, 'created');
   assert.equal(store.session(completed.id)?.status, 'completed');
-  assert.equal(store.session(completed.id)?.analysisStatus, 'pending');
+  assert.equal(store.session(completed.id)?.analysisStatus, 'not_requested');
   assert.deepEqual(store.config(), config);
 });

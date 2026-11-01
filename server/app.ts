@@ -1,7 +1,7 @@
 import express from 'express';
 import { createServer, type IncomingMessage } from 'node:http';
 import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { z } from 'zod';
@@ -12,6 +12,9 @@ import { controlSchema } from '../shared/model-config.js';
 import { configSchema, customerSchema } from './validation.js';
 import { INTEGRATION_CONTRACTS } from './contracts.js';
 import { createSeedSession, SEED_MODEL } from './seed.js';
+import { DeepSeekClient } from './deepseek.js';
+import { AnalysisWorker } from './jobs.js';
+import { Recordings, RecordingError } from './recordings.js';
 
 function localRequest(req: IncomingMessage) {
   const isLoopback = (name: string) => ['localhost', '127.0.0.1', '[::1]'].includes(name);
@@ -25,9 +28,12 @@ function localRequest(req: IncomingMessage) {
       && (source.port === target.port || source.port === '5173');
   } catch { return false; }
 }
-export function createApp(options: { databasePath: string; apiKey?: string; seedUrl?: string; staticPath?: string; webSearchKey?: string }) {
+export function createApp(options: { databasePath: string; apiKey?: string; seedUrl?: string; staticPath?: string; webSearchKey?: string;
+  deepseekApiKey?: string; deepseekBaseUrl?: string; deepseekModel?: string; recordingsPath?: string }) {
   const store = new Store(options.databasePath);
   const manager = new SessionManager(store, options.apiKey ?? '', options.seedUrl, options.webSearchKey);
+  const worker = new AnalysisWorker(store, options.deepseekApiKey ? new DeepSeekClient({ apiKey: options.deepseekApiKey, baseUrl: options.deepseekBaseUrl, model: options.deepseekModel }) : undefined);
+  const recordings = new Recordings(options.recordingsPath ?? resolve(options.databasePath === ':memory:' ? 'data' : dirname(options.databasePath), 'recordings'));
   const app = express();
   app.disable('x-powered-by');
   app.use((req, res, next) => {
@@ -40,7 +46,7 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
   app.get('/api/health', (_req, res) => res.json({ ok: true }));
   app.get('/api/bootstrap', (_req, res) => res.json({
     config: store.config(), provider: { configured: Boolean(options.apiKey), webSearchConfigured: Boolean(options.webSearchKey), model: SEED_MODEL, protocol: 'SeedDuplex 3.0 / JSON WebSocket' },
-    customers: store.customers(), sessions: store.sessions(),
+    customers: store.customers(), sessions: store.sessions(), sessionTotal: store.sessionCount(), analysis: worker.status(),
   }));
   app.put('/api/config', (req, res) => res.json(store.saveConfig(configSchema.parse(req.body))));
   app.get('/api/prompt/default', (_req, res) => res.json({ systemPrompt: DEFAULT_SYSTEM_PROMPT, opening: OPENING, config: DEFAULT_CONFIG }));
@@ -57,7 +63,33 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
   });
   app.post('/api/customers/import', (req, res) => {
     const { customers } = z.object({ customers: z.array(customerSchema).min(1).max(5000) }).parse(req.body);
-    res.json({ customers: store.importCustomers(customers), imported: customers.length });
+    const saved = store.importCustomers(customers);
+    worker.wake();
+    res.json({ customers: saved, imported: customers.length, analysis: worker.status() });
+  });
+  app.get('/api/customers/export', (_req, res) => {
+    res.setHeader('Content-Disposition', 'attachment; filename="customers.json"');
+    res.json({ customers: store.customers().map(({ industryStatus, industryError, ...customer }) => customer) });
+  });
+  app.post('/api/customers/enrich', (req, res) => {
+    const { retryFailed } = z.object({ retryFailed: z.boolean().default(true) }).parse(req.body ?? {});
+    for (const customer of store.customers()) if (!customer.industry?.trim() || (retryFailed && customer.industryStatus === 'failed')) store.enqueueIndustry(customer, true);
+    worker.wake();
+    res.status(202).json(worker.status());
+  });
+  app.get('/api/analysis/status', (_req, res) => res.json(worker.status()));
+  app.get('/api/sessions', (req, res) => {
+    const query = z.object({
+      page: z.coerce.number().int().min(1).max(1000000).default(1), pageSize: z.coerce.number().int().min(1).max(100).default(20),
+      answeredOnly: z.enum(['true', 'false']).default('true').transform(value => value === 'true'),
+      dateField: z.enum(['createdAt', 'answeredAt', 'endedAt']).default('createdAt'),
+      from: z.iso.datetime({ offset: true }).optional().transform(value => value ? new Date(value).toISOString() : undefined),
+      to: z.iso.datetime({ offset: true }).optional().transform(value => value ? new Date(value).toISOString() : undefined),
+      sortBy: z.enum(['createdAt', 'status', 'grade']).default('createdAt'), sortDir: z.enum(['asc', 'desc']).default('desc'),
+      grade: z.enum(['A', 'B', 'C', 'D', 'E', 'F', 'G']).optional(), search: z.string().trim().max(160).optional(),
+    }).parse(req.query);
+    if (query.from && query.to && query.from >= query.to) { res.status(400).json({ error: '结束日期需晚于开始日期' }); return; }
+    res.json(store.listSessions(query));
   });
   app.post('/api/sessions', (req, res) => {
     const { customerId, mode } = z.object({ customerId: z.string(), mode: z.enum(['simulation', 'seed']) }).parse(req.body);
@@ -75,6 +107,32 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
     const session = store.session(req.params.id);
     if (!session) { res.status(404).json({ error: '通话记录不存在' }); return; }
     res.json(session);
+  });
+  app.post('/api/sessions/:id/analyze', (req, res) => {
+    const session = store.session(req.params.id);
+    if (!session) { res.status(404).json({ error: '通话记录不存在' }); return; }
+    if (!store.enqueueAnalysis(session.id, true)) { res.status(409).json({ error: '仅已接通且已结束的语音通话参与评估；文字预演不计入意向统计' }); return; }
+    worker.wake();
+    res.status(202).json(store.session(session.id));
+  });
+  app.post('/api/sessions/:id/recording', express.raw({ type: ['audio/webm', 'audio/mp4', 'audio/ogg'], limit: '25mb' }), async (req, res) => {
+    const session = store.session(req.params.id);
+    if (!session) { res.status(404).json({ error: '通话记录不存在' }); return; }
+    if (session.mode !== 'seed' || !session.answeredAt || !['completed', 'failed'].includes(session.status)) {
+      res.status(409).json({ error: '仅已结束的接通语音通话可以保存录音' }); return;
+    }
+    if (session.recording) { res.json(session.recording); return; }
+    if (!Buffer.isBuffer(req.body)) { res.status(415).json({ error: '录音格式需为 audio/webm、audio/mp4 或 audio/ogg' }); return; }
+    const recording = await recordings.save(session.id, req.body, req.get('content-type') ?? '');
+    store.saveRecording(session.id, recording);
+    res.status(201).json(recording);
+  });
+  app.get('/api/sessions/:id/recording', (req, res) => {
+    const recording = store.session(req.params.id)?.recording;
+    if (!recording) { res.status(404).json({ error: '此通话没有可用录音' }); return; }
+    const path = recordings.path(req.params.id, recording.mimeType);
+    if (!existsSync(path)) { res.status(404).json({ error: '录音文件已被移动或删除' }); return; }
+    res.type(recording.mimeType).sendFile(path);
   });
   app.get('/api/sessions/:id/runtime', (req, res) => {
     if (!store.session(req.params.id)) { res.status(404).json({ error: '通话记录不存在' }); return; }
@@ -105,11 +163,11 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
     app.get('/', (_req, res) => res.type('text/plain').send('泓动引擎 API 已启动。开发界面：http://127.0.0.1:5173；生产运行先 npm run build。'));
   }
   app.use((error: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    if (error instanceof ControlError) { res.status(error.status).json({ error: error.message }); return; }
+    if (error instanceof ControlError || error instanceof RecordingError) { res.status(error.status).json({ error: error.message }); return; }
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('；') }); return;
     }
-    if (error?.type === 'entity.too.large') { res.status(413).json({ error: 'JSON 文件超过2MB，请分批导入' }); return; }
+    if (error?.type === 'entity.too.large') { res.status(413).json({ error: '上传内容过大，JSON 上限2MB，录音上限25MB' }); return; }
     if (error instanceof SyntaxError) { res.status(400).json({ error: 'JSON 格式有误，请检查引号与逗号' }); return; }
     // Avoid returning raw SDK/request errors, secrets, or local file paths.
     res.status(500).json({ error: '本地服务处理失败，请检查数据文件权限或重启后重试' });
@@ -124,11 +182,12 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
     }
     wss.handleUpgrade(req, socket, head, ws => manager.attach(match[1], ws));
   });
-  return { app, server, store, manager, close: async () => {
+  return { app, server, store, manager, worker, close: async () => {
     manager.shutdown();
+    await worker.close();
     for (const socket of wss.clients) socket.terminate();
     wss.close();
-    await new Promise<void>((done, reject) => server.close(error => error ? reject(error) : done()));
+    if (server.listening) await new Promise<void>((done, reject) => server.close(error => error ? reject(error) : done()));
     store.close();
   } };
 }

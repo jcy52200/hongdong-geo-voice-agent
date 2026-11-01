@@ -4,13 +4,19 @@ import { dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { buildPrompt, DEFAULT_SYSTEM_PROMPT, OPENING } from './prompt.js';
 import type { AgentConfig, Customer, Session, SessionStatus, Transcript } from './types.js';
+import type { CallAnalysis } from '../shared/analysis.js';
 
 export const DEFAULT_CONFIG: AgentConfig = {
   agentName: '小泓', voice: 'zh_male_m191_uranus_bigtts', speed: 0, extraInstructions: '',
-  systemPrompt: DEFAULT_SYSTEM_PROMPT,
-  loudness: 0, opening: OPENING, modelOptions: {},
+  systemPrompt: DEFAULT_SYSTEM_PROMPT, loudness: 0, opening: OPENING, modelOptions: {},
 };
 type Row = Record<string, any>;
+export interface SessionQuery {
+  page: number; pageSize: number; answeredOnly: boolean;
+  dateField: 'createdAt' | 'answeredAt' | 'endedAt'; from?: string; to?: string;
+  sortBy: 'createdAt' | 'status' | 'grade'; sortDir: 'asc' | 'desc'; grade?: string; search?: string;
+}
+export interface IndustryJob { customerId: string; camp: string; attempts: number }
 export class Store {
   readonly db: DatabaseSync;
   constructor(path: string) {
@@ -20,9 +26,7 @@ export class Store {
       PRAGMA journal_mode = WAL;
       PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS customers (
-        id TEXT PRIMARY KEY, phone TEXT UNIQUE NOT NULL, data TEXT NOT NULL
-      );
+      CREATE TABLE IF NOT EXISTS customers (id TEXT PRIMARY KEY, phone TEXT UNIQUE NOT NULL, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY, customer TEXT NOT NULL, config TEXT NOT NULL,
         mode TEXT NOT NULL, status TEXT NOT NULL, prompt TEXT NOT NULL, prompt_hash TEXT NOT NULL,
@@ -42,12 +46,35 @@ export class Store {
         id TEXT PRIMARY KEY, session_id TEXT UNIQUE NOT NULL REFERENCES sessions(id),
         status TEXT NOT NULL DEFAULT 'pending', result TEXT, created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS industry_jobs (
+        customer_id TEXT PRIMARY KEY REFERENCES customers(id), camp TEXT NOT NULL,
+        status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT,
+        next_attempt TEXT, updated_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_transcripts_session ON transcripts(session_id);
       CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+      CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at);
     `);
-    // A restarted worker cannot resume a cloud socket or browser playback timeline.
-    this.db.prepare(`UPDATE sessions SET status='failed', error='服务重启，会话已结束；请新建测试', ended_at=?
+    // Additive migrations retain existing customers, calls and configuration.
+    this.addColumns('sessions', { answered_at: 'TEXT', end_reason: 'TEXT', recording: 'TEXT' });
+    this.addColumns('analysis_jobs', { error: 'TEXT', attempts: 'INTEGER NOT NULL DEFAULT 0', next_attempt: 'TEXT', updated_at: 'TEXT' });
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_answered ON sessions(answered_at);
+      UPDATE sessions SET answered_at=(SELECT MIN(created_at) FROM events WHERE session_id=sessions.id AND type='session.created')
+        WHERE mode='seed' AND answered_at IS NULL;
+      UPDATE analysis_jobs SET status='not_requested' WHERE session_id IN (SELECT id FROM sessions WHERE answered_at IS NULL);
+      UPDATE sessions SET analysis_status='not_requested' WHERE answered_at IS NULL;
+      UPDATE analysis_jobs SET status='pending' WHERE status='running';
+      UPDATE sessions SET analysis_status='pending' WHERE analysis_status='running';
+      UPDATE industry_jobs SET status='pending' WHERE status='running';`);
+    this.db.prepare(`UPDATE sessions SET status='failed', error='服务重启，会话已结束；请新建测试', ended_at=?,end_reason='service_restart'
       WHERE status IN ('connecting','opening','active')`).run(new Date().toISOString());
+    for (const row of this.db.prepare(`SELECT id FROM sessions WHERE answered_at IS NOT NULL AND status IN ('completed','failed')
+      AND (analysis_status='not_requested' OR NOT EXISTS (SELECT 1 FROM analysis_jobs WHERE session_id=sessions.id))`).all() as Row[]) this.enqueueAnalysis(row.id);
+    for (const customer of this.customers()) if (!customer.industry?.trim()) this.enqueueIndustry(customer);
+  }
+  private addColumns(table: string, columns: Record<string, string>) {
+    const existing = new Set((this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).map(row => row.name));
+    for (const [name, type] of Object.entries(columns)) if (!existing.has(name)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
   }
   close() { this.db.close(); }
   config(): AgentConfig {
@@ -55,30 +82,67 @@ export class Store {
     return row ? { ...DEFAULT_CONFIG, ...JSON.parse(row.value) } : { ...DEFAULT_CONFIG };
   }
   saveConfig(config: AgentConfig) {
-    this.db.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
-      .run('agent', JSON.stringify(config));
+    this.db.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('agent', JSON.stringify(config));
     return config;
   }
+  private customerRow(row: Row): Customer {
+    const customer = JSON.parse(row.data);
+    if (row.industry_status) customer.industryStatus = row.industry_status;
+    if (row.industry_error) customer.industryError = row.industry_error;
+    return customer;
+  }
   customers(): Customer[] {
-    return (this.db.prepare('SELECT data FROM customers ORDER BY rowid DESC').all() as Row[]).map(r => JSON.parse(r.data));
+    return (this.db.prepare(`SELECT c.data,j.status AS industry_status,j.error AS industry_error FROM customers c
+      LEFT JOIN industry_jobs j ON j.customer_id=c.id ORDER BY c.rowid DESC`).all() as Row[]).map(row => this.customerRow(row));
   }
   customer(id: string): Customer | undefined {
-    const row = this.db.prepare('SELECT data FROM customers WHERE id=?').get(id) as Row | undefined;
-    return row ? JSON.parse(row.data) : undefined;
+    const row = this.db.prepare(`SELECT c.data,j.status AS industry_status,j.error AS industry_error FROM customers c
+      LEFT JOIN industry_jobs j ON j.customer_id=c.id WHERE c.id=?`).get(id) as Row | undefined;
+    return row ? this.customerRow(row) : undefined;
   }
   importCustomers(input: Omit<Customer, 'id'>[]): Customer[] {
     this.db.exec('BEGIN');
     try {
       for (const item of input) {
         const normalizedPhone = item.phone.replace(/[ ()-]/g, '');
-        const existing = this.db.prepare('SELECT id FROM customers WHERE phone=?').get(normalizedPhone) as Row | undefined;
-        const customer: Customer = { ...item, phone: normalizedPhone, id: existing?.id ?? randomUUID() };
-        this.db.prepare(`INSERT INTO customers(id,phone,data) VALUES (?,?,?)
-          ON CONFLICT(phone) DO UPDATE SET data=excluded.data`).run(customer.id, customer.phone, JSON.stringify(customer));
+        const existing = this.db.prepare('SELECT id,data FROM customers WHERE phone=?').get(normalizedPhone) as Row | undefined;
+        const old = existing ? JSON.parse(existing.data) as Customer : undefined;
+        const industry = item.industry?.trim() || (old?.camp === item.camp ? old.industry : '') || '';
+        const { industryStatus: _status, industryError: _error, ...original } = item;
+        const customer: Customer = { ...original, phone: normalizedPhone, industry, id: existing?.id ?? randomUUID() };
+        this.db.prepare(`INSERT INTO customers(id,phone,data) VALUES (?,?,?) ON CONFLICT(phone) DO UPDATE SET data=excluded.data`)
+          .run(customer.id, customer.phone, JSON.stringify(customer));
+        if (industry) this.db.prepare('DELETE FROM industry_jobs WHERE customer_id=?').run(customer.id);
+        else this.enqueueIndustry(customer, old?.camp !== customer.camp);
       }
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
     return this.customers();
+  }
+  enqueueIndustry(customer: Customer, force = false) {
+    if (!force && customer.industry?.trim()) return;
+    this.db.prepare(`INSERT INTO industry_jobs(customer_id,camp,status,updated_at) VALUES (?,?,'pending',?)
+      ON CONFLICT(customer_id) DO UPDATE SET camp=excluded.camp,status='pending',attempts=0,error=NULL,next_attempt=NULL,updated_at=excluded.updated_at
+      WHERE industry_jobs.camp!=excluded.camp OR ?=1`).run(customer.id, customer.camp, new Date().toISOString(), force ? 1 : 0);
+  }
+  claimIndustries(limit = 20): IndustryJob[] {
+    const rows = this.db.prepare(`SELECT customer_id AS customerId,camp,attempts FROM industry_jobs
+      WHERE status='pending' AND (next_attempt IS NULL OR next_attempt<=?) ORDER BY updated_at LIMIT ?`).all(new Date().toISOString(), limit) as unknown as IndustryJob[];
+    const update = this.db.prepare(`UPDATE industry_jobs SET status='running',attempts=attempts+1 WHERE customer_id=? AND camp=?`);
+    for (const row of rows) { update.run(row.customerId, row.camp); row.attempts++; }
+    return rows;
+  }
+  completeIndustry(job: IndustryJob, industry: string) {
+    const current = this.customer(job.customerId);
+    if (!current || current.camp !== job.camp || current.industryStatus !== 'running') return;
+    const { industryStatus: _status, industryError: _error, ...data } = current;
+    this.db.prepare('UPDATE customers SET data=? WHERE id=?').run(JSON.stringify({ ...data, industry }), current.id);
+    this.db.prepare(`UPDATE industry_jobs SET status='completed',error=NULL,next_attempt=NULL,updated_at=? WHERE customer_id=? AND camp=?`)
+      .run(new Date().toISOString(), job.customerId, job.camp);
+  }
+  failIndustry(job: IndustryJob, error: string, retryAt?: string) {
+    this.db.prepare(`UPDATE industry_jobs SET status=?,error=?,next_attempt=?,updated_at=? WHERE customer_id=? AND camp=? AND status='running'`)
+      .run(retryAt ? 'pending' : 'failed', error, retryAt ?? null, new Date().toISOString(), job.customerId, job.camp);
   }
   createSession(customer: Customer, mode: Session['mode']): Session {
     const config = this.config();
@@ -89,29 +153,98 @@ export class Store {
         createHash('sha256').update(prompt).digest('hex'), new Date().toISOString(), 'not_requested');
     return this.session(id)!;
   }
-  session(id: string): Session | undefined {
-    const row = this.db.prepare('SELECT * FROM sessions WHERE id=?').get(id) as Row | undefined;
-    if (!row) return undefined;
+  private sessionRow(row: Row, full = true): Session {
     return {
-      id: row.id, customer: JSON.parse(row.customer), configSnapshot: JSON.parse(row.config), mode: row.mode,
-      status: row.status, prompt: row.prompt, promptHash: row.prompt_hash, createdAt: row.created_at,
-      endedAt: row.ended_at ?? undefined, error: row.error ?? undefined, analysisStatus: row.analysis_status,
-      transcripts: this.transcripts(id),
-    };
+      id: row.id, customer: JSON.parse(row.customer), configSnapshot: full ? JSON.parse(row.config) : undefined,
+      mode: row.mode, status: row.status, prompt: full ? row.prompt : '', promptHash: row.prompt_hash, createdAt: row.created_at,
+      endedAt: row.ended_at ?? undefined, answeredAt: row.answered_at ?? undefined, endReason: row.end_reason ?? undefined,
+      error: row.error ?? undefined, analysisStatus: row.analysis_status, analysis: row.result ? JSON.parse(row.result) : undefined,
+      analysisError: row.analysis_error ?? undefined, recording: row.recording ? JSON.parse(row.recording) : undefined,
+      transcripts: full ? this.transcripts(row.id) : [],
+    } as Session;
+  }
+  session(id: string): Session | undefined {
+    const row = this.db.prepare(`SELECT s.*,a.result,a.error AS analysis_error FROM sessions s LEFT JOIN analysis_jobs a ON a.session_id=s.id WHERE s.id=?`).get(id) as Row | undefined;
+    return row ? this.sessionRow(row) : undefined;
   }
   sessions(): Session[] {
-    return (this.db.prepare('SELECT id FROM sessions ORDER BY rowid DESC LIMIT 100').all() as Row[])
-      .map(row => this.session(row.id)!);
+    return (this.db.prepare('SELECT id FROM sessions ORDER BY rowid DESC LIMIT 10').all() as Row[]).map(row => this.session(row.id)!);
   }
-  status(id: string, status: SessionStatus, error?: string) {
-    const ended = status === 'completed' || status === 'failed';
-    this.db.prepare('UPDATE sessions SET status=?,error=?,ended_at=? WHERE id=?')
-      .run(status, error ?? null, ended ? new Date().toISOString() : null, id);
-    if (status === 'completed') {
-      this.db.prepare(`INSERT OR IGNORE INTO analysis_jobs(id,session_id,status,created_at) VALUES (?,?,'pending',?)`)
-        .run(randomUUID(), id, new Date().toISOString());
-      this.db.prepare(`UPDATE sessions SET analysis_status='pending' WHERE id=?`).run(id);
+  sessionCount(): number { return Number((this.db.prepare('SELECT COUNT(*) AS count FROM sessions').get() as Row).count); }
+  listSessions(query: SessionQuery) {
+    const clauses: string[] = []; const values: (string | number)[] = [];
+    if (query.answeredOnly) clauses.push('s.answered_at IS NOT NULL');
+    const dateField = ({ createdAt: 's.created_at', answeredAt: 's.answered_at', endedAt: 's.ended_at' })[query.dateField];
+    if (query.from) { clauses.push(`${dateField}>=?`); values.push(query.from); }
+    if (query.to) { clauses.push(`${dateField}<?`); values.push(query.to); }
+    if (query.grade) { clauses.push(`json_extract(a.result,'$.grade')=?`); values.push(query.grade); }
+    if (query.search) {
+      clauses.push(`(json_extract(s.customer,'$.camp') LIKE ? ESCAPE '\\' OR json_extract(s.customer,'$.name') LIKE ? ESCAPE '\\' OR json_extract(s.customer,'$.phone') LIKE ? ESCAPE '\\')`);
+      const term = `%${query.search.replace(/[\\%_]/g, '\\$&')}%`; values.push(term, term, term);
     }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const join = 'FROM sessions s LEFT JOIN analysis_jobs a ON a.session_id=s.id';
+    const total = Number((this.db.prepare(`SELECT COUNT(*) AS count ${join} ${where}`).get(...values) as Row).count);
+    const page = Math.max(1, Math.min(query.page, Math.max(1, Math.ceil(total / query.pageSize))));
+    const field = ({ createdAt: 's.created_at', status: 's.status', grade: `CASE json_extract(a.result,'$.grade') WHEN 'A' THEN 7 WHEN 'B' THEN 6 WHEN 'C' THEN 5 WHEN 'D' THEN 4 WHEN 'E' THEN 3 WHEN 'F' THEN 2 WHEN 'G' THEN 1 END` })[query.sortBy];
+    const direction = query.sortDir === 'asc' ? 'ASC' : 'DESC';
+    const rows = this.db.prepare(`SELECT s.*,a.result,a.error AS analysis_error ${join} ${where}
+      ORDER BY ${field} IS NULL ASC,${field} ${direction},s.created_at DESC,s.id ASC LIMIT ? OFFSET ?`).all(...values, query.pageSize, (page - 1) * query.pageSize) as Row[];
+    return { items: rows.map(row => this.sessionRow(row, false)), total, page, pageSize: query.pageSize };
+  }
+  answered(id: string) {
+    this.db.prepare(`UPDATE sessions SET answered_at=COALESCE(answered_at,?) WHERE id=? AND mode='seed'`).run(new Date().toISOString(), id);
+  }
+  status(id: string, status: SessionStatus, error?: string, endReason?: string) {
+    const ended = status === 'completed' || status === 'failed';
+    const old = this.session(id);
+    if (!old || ['completed', 'failed'].includes(old.status)) return;
+    this.db.prepare('UPDATE sessions SET status=?,error=?,ended_at=?,end_reason=? WHERE id=?')
+      .run(status, error ?? null, ended ? new Date().toISOString() : null, ended ? (endReason ?? (status === 'failed' ? 'transport_error' : 'local_finish')) : null, id);
+    if (ended && old.answeredAt) this.enqueueAnalysis(id);
+  }
+  enqueueAnalysis(id: string, force = false) {
+    const session = this.session(id);
+    if (!session?.answeredAt || !['completed', 'failed'].includes(session.status)) return false;
+    const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO analysis_jobs(id,session_id,status,created_at,updated_at) VALUES (?,?,'pending',?,?)
+      ON CONFLICT(session_id) DO UPDATE SET status='pending',error=NULL,attempts=0,next_attempt=NULL,updated_at=excluded.updated_at
+      WHERE analysis_jobs.status='not_requested' OR (?=1 AND analysis_jobs.status NOT IN ('pending','running'))`).run(randomUUID(), id, now, now, force ? 1 : 0);
+    const job = this.db.prepare('SELECT status FROM analysis_jobs WHERE session_id=?').get(id) as Row;
+    this.db.prepare('UPDATE sessions SET analysis_status=? WHERE id=?').run(job.status, id);
+    return true;
+  }
+  claimAnalysis(): { session: Session; attempts: number } | undefined {
+    const row = this.db.prepare(`SELECT session_id,attempts FROM analysis_jobs WHERE status='pending'
+      AND (next_attempt IS NULL OR next_attempt<=?) ORDER BY created_at LIMIT 1`).get(new Date().toISOString()) as Row | undefined;
+    if (!row) return undefined;
+    this.db.prepare(`UPDATE analysis_jobs SET status='running',attempts=attempts+1,updated_at=? WHERE session_id=?`).run(new Date().toISOString(), row.session_id);
+    this.db.prepare(`UPDATE sessions SET analysis_status='running' WHERE id=?`).run(row.session_id);
+    return { session: this.session(row.session_id)!, attempts: row.attempts + 1 };
+  }
+  completeAnalysis(id: string, result: CallAnalysis) {
+    this.db.prepare(`UPDATE analysis_jobs SET status='completed',result=?,error=NULL,next_attempt=NULL,updated_at=? WHERE session_id=?`)
+      .run(JSON.stringify(result), new Date().toISOString(), id);
+    this.db.prepare(`UPDATE sessions SET analysis_status='completed' WHERE id=?`).run(id);
+  }
+  failAnalysis(id: string, error: string, retryAt?: string) {
+    const status = retryAt ? 'pending' : 'failed';
+    this.db.prepare(`UPDATE analysis_jobs SET status=?,error=?,next_attempt=?,updated_at=? WHERE session_id=?`).run(status, error, retryAt ?? null, new Date().toISOString(), id);
+    this.db.prepare('UPDATE sessions SET analysis_status=? WHERE id=?').run(status, id);
+  }
+  jobCounts() {
+    const counts = { pending: 0, running: 0, failed: 0, industryPending: 0, industryRunning: 0, industryFailed: 0 };
+    for (const row of this.db.prepare('SELECT status,COUNT(*) AS count FROM analysis_jobs GROUP BY status').all() as Row[]) {
+      if (row.status in counts) counts[row.status as 'pending' | 'running' | 'failed'] = Number(row.count);
+    }
+    for (const row of this.db.prepare('SELECT status,COUNT(*) AS count FROM industry_jobs GROUP BY status').all() as Row[]) {
+      const key = ({ pending: 'industryPending', running: 'industryRunning', failed: 'industryFailed' } as const)[row.status as 'pending'];
+      if (key) counts[key] = Number(row.count);
+    }
+    return counts;
+  }
+  saveRecording(id: string, recording: NonNullable<Session['recording']>) {
+    this.db.prepare('UPDATE sessions SET recording=? WHERE id=?').run(JSON.stringify(recording), id);
   }
   transcripts(id: string): Transcript[] {
     return (this.db.prepare('SELECT * FROM transcripts WHERE session_id=? ORDER BY rowid').all(id) as Row[]).map(r => ({
@@ -119,8 +252,7 @@ export class Store {
     }));
   }
   transcript(id: string, key: string, kind: Transcript['kind'], text: string, final: boolean, eventId?: string): Transcript {
-    const row = this.db.prepare('SELECT * FROM transcripts WHERE session_id=? AND provider_key=? AND kind=?')
-      .get(id, key, kind) as Row | undefined;
+    const row = this.db.prepare('SELECT * FROM transcripts WHERE session_id=? AND provider_key=? AND kind=?').get(id, key, kind) as Row | undefined;
     if (row?.final) return this.transcripts(id).find(t => t.id === row.id)!;
     const transcript = { id: row?.id ?? randomUUID(), eventId, kind, text, final, createdAt: row?.created_at ?? new Date().toISOString() };
     this.db.prepare(`INSERT INTO transcripts(id,session_id,provider_key,event_id,kind,text,final,created_at)
@@ -130,14 +262,14 @@ export class Store {
     return transcript;
   }
   event(id: string, type: string, payload: unknown) {
-    this.db.prepare('INSERT INTO events(session_id,type,payload,created_at) VALUES (?,?,?,?)')
-      .run(id, type, JSON.stringify(payload), new Date().toISOString());
+    this.db.prepare('INSERT INTO events(session_id,type,payload,created_at) VALUES (?,?,?,?)').run(id, type, JSON.stringify(payload), new Date().toISOString());
   }
   exportSession(id: string) {
-    return { session: this.session(id),
+    const session = this.session(id);
+    return { session,
       events: (this.db.prepare('SELECT type,payload,created_at AS createdAt FROM events WHERE session_id=? ORDER BY id').all(id) as Row[])
         .map(r => ({ type: r.type, payload: JSON.parse(r.payload), createdAt: r.createdAt })),
-      analysis: { status: this.session(id)?.analysisStatus, result: null, note: 'LLM 分析模块预留，尚未运行意向分析' },
+      analysis: { status: session?.analysisStatus, result: session?.analysis ?? null, note: session?.analysis ? '自动评估结果，请结合客户原话复核' : '尚未运行成功；仅接通的语音通话参与评估' },
     };
   }
 }

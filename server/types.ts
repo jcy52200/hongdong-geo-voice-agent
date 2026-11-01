@@ -1,4 +1,5 @@
 import type { AgentConfig, Customer } from './prompt.js';
+import type { AnalysisStatus, CallAnalysis } from '../shared/analysis.js';
 export type { AgentConfig, Customer } from './prompt.js';
 export type SessionStatus = 'created' | 'connecting' | 'opening' | 'active' | 'completed' | 'failed';
 export interface Transcript {
@@ -17,11 +18,16 @@ export interface Session {
   status: SessionStatus;
   createdAt: string;
   endedAt?: string;
+  answeredAt?: string;
+  endReason?: string;
   prompt: string;
   promptHash: string;
   transcripts: Transcript[];
   error?: string;
-  analysisStatus: 'pending' | 'not_requested';
+  analysisStatus: AnalysisStatus;
+  analysis?: CallAnalysis;
+  analysisError?: string;
+  recording?: { url: string; mimeType: string; bytes: number; createdAt: string };
 }
 export type ServerEvent =
   | { type: 'session'; session: Session }

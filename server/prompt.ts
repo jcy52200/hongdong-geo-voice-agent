@@ -8,6 +8,8 @@ export interface Customer {
   phone: string;
   address: string;
   industry?: string;
+  industryStatus?: 'pending' | 'running' | 'completed' | 'failed';
+  industryError?: string;
 }
 
 export interface AgentConfig {
@@ -27,7 +29,7 @@ export const OPENING = '歪～，哎您好，我们这边儿是豆包的服务�
 export const DEFAULT_SYSTEM_PROMPT = readFileSync(new URL('../prompts/sales-agent.md', import.meta.url), 'utf8').trim();
 export function getOpening(config: AgentConfig, customer?: Customer) {
   const text = config.opening?.trim() || OPENING;
-  return customer ? text.replace(/&(camp|name|phone|address)(?![A-Za-z0-9_])/g, (_match, key: keyof Customer) => String(customer[key] ?? '')) : text;
+  return customer ? text.replace(/&(camp|name|phone|address|industry)(?![A-Za-z0-9_])/g, (_match, key: keyof Customer) => String(customer[key] || (key === 'industry' ? '待确认行业' : ''))) : text;
 }
 
 /**
@@ -42,6 +44,7 @@ export function buildPrompt(customer: Customer, config: AgentConfig): string {
     '&name': customer.name,
     '&phone': customer.phone,
     '&address': customer.address,
+    '&industry': customer.industry || '待确认行业',
     industry: customer.industry ?? null,
   };
   const agentData = {

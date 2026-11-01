@@ -8,7 +8,7 @@ export const customerSchema = z.object({
   phone: z.string().trim().regex(/^\+?[0-9 ()-]{5,25}$/, '电话需为字符串，包含5至25位号码字符'),
   address: z.string().trim().max(240).default(''),
   industry: z.string().trim().max(100).optional(),
-});
+}).passthrough();
 export const configSchema = z.object({
   agentName: z.string().trim().min(1).max(40),
   voice: z.string().trim().min(1).max(120).regex(/^[a-zA-Z0-9_\-]+$/),

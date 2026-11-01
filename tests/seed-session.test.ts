@@ -246,7 +246,7 @@ test('浏览器或云端断开均持久化失败并释放对端连接', { timeou
   assert.ok(first.endedAt);
   assert.match(first.error ?? '', /浏览器/);
   assert.ok(first.transcripts.some(row => row.text === '保留断开前记录'));
-  assert.equal(first.analysisStatus, 'not_requested');
+  assert.equal(first.analysisStatus, 'pending', '接通后异常结束也需评估，不能丢失');
 
   const providerDisconnect = await app.connect(1);
   await providerDisconnect.provider.take('session.create');
@@ -258,5 +258,5 @@ test('浏览器或云端断开均持久化失败并释放对端连接', { timeou
   assert.equal(second.status, 'failed');
   assert.ok(second.endedAt);
   assert.match(second.error ?? '', /SeedDuplex.*关闭/);
-  assert.equal(second.analysisStatus, 'not_requested');
+  assert.equal(second.analysisStatus, 'pending');
 });

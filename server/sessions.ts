@@ -115,6 +115,7 @@ export class SessionManager {
     const safeEvent = this.redact(event);
     if (event.type !== 'response.output_audio.delta') this.store.event(id, event.type, safeEvent);
     if (event.type === 'session.created' && status === 'connecting') {
+      this.store.answered(id);
       call.cloudId = event.session?.id || id;
       clearTimeout(call.timer);
       this.state(id, 'opening');
