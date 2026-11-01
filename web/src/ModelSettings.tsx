@@ -54,7 +54,7 @@ export function ModelSettings({ config, searchConfigured, onChange, onInvalid, o
       <Range label="音量 · loudness" value={config.loudness ?? 0} onChange={loudness => onChange({ ...config, loudness })} />
       <div className="parameter-note"><strong>音调 / pitch</strong><p>当前 SeedDuplex 3.0 文档没有独立音调字段。可更换音色，或在限制词中描述“低沉、明亮”等声音风格；不混用其他 TTS 接口的 pitch 参数。</p></div>
       <Toggle label="响度均衡 · enable_loudness_norm" checked={extra.enable_loudness_norm ?? true} onChange={value => changeExtra({ enable_loudness_norm: value })} hint="项目默认开启；这是模型输出处理，与本机扬声器音量不同。" />
-      <label className="field span-all">打招呼语句 / 首句 · speech_text_buffer.commit<textarea rows={4} maxLength={2000} required value={config.opening ?? ''} onChange={event => onChange({ ...config, opening: event.target.value })} /><small>可以修改首句，支持 &amp;camp、&amp;name、&amp;phone、&amp;address。AI 仍先开口，首句实际播完后才接收客户输入。</small></label>
+      <label className="field span-all">打招呼语句 / 首句 · speech_text_buffer.commit<textarea rows={4} maxLength={2000} required value={config.opening ?? ''} onChange={event => onChange({ ...config, opening: event.target.value })} /><small>可以修改首句，支持 &amp;camp、&amp;name、&amp;phone、&amp;address、&amp;industry。AI 仍先开口，首句实际播完后才接收客户输入。</small></label>
       <label className="field">括号内容过滤上限 · max_length_to_filter_parenthesis<input type="number" min={0} max={100} value={tts.max_length_to_filter_parenthesis ?? 0} onChange={event => changeTts({ max_length_to_filter_parenthesis: Number(event.target.value) })} /><small>0 不过滤；1 至 100 按官方建议范围设置，超长括号内容不会被过滤。</small></label>
     </div></section>
     <details className="panel parameter-section" open><summary>语音识别与行业热词 <code>extension.asr.extra</code></summary><div className="panel-body parameter-grid">

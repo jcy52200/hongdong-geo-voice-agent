@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24.0.0" },
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "scripts": {
     "dev": "concurrently -k -n api,web \"tsx watch server/index.ts\" \"vite --host 127.0.0.1\"",
     "dev:server": "tsx watch server/index.ts",
@@ -13,7 +15,9 @@
     "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
     "express": "^5.1.0",
+    "motion": "^14.9.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "ws": "^8.18.3",

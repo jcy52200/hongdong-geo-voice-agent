@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { GRADES, GRADE_LABELS, type Grade } from '../../shared/analysis';
 import { api, messageOf } from './api';
 import type { AnalysisProviderStatus, Session, SessionPage, SessionStatus } from './types';
-import './call-records.css';
 
 type DateField = 'createdAt' | 'answeredAt' | 'endedAt';
 type SortField = 'createdAt' | 'status' | 'grade';
@@ -61,8 +60,8 @@ function AnalysisState({ session }: { session: Session }) {
   return <span className="call-analysis-label">{session.mode === 'simulation' ? '文字模拟不评估' : session.answeredAt ? '通话结束后评估' : '未接通不评估'}</span>;
 }
 
-export function CallRecords({ initialSessionId, onCloseDetail }: { initialSessionId?: string; onCloseDetail?: () => void }) {
-  const [filters, setFilters] = useState<Filters>(defaults);
+export function CallRecords({ initialSessionId, initialGrade, initialRange, onCloseDetail }: { initialSessionId?: string; initialGrade?: Grade; initialRange?: { from: string; to: string }; onCloseDetail?: () => void }) {
+  const [filters, setFilters] = useState<Filters>(() => ({ ...defaults, grade: initialGrade ?? '', ...(initialRange ? { from: localDate(new Date(initialRange.from)), to: localDate(new Date(Date.parse(initialRange.to) - 1)), range: 'custom' } : {}) }));
   const [page, setPage] = useState<SessionPage>({ items: [], total: 0, page: 1, pageSize: 20 });
   const [provider, setProvider] = useState<AnalysisProviderStatus | null>(null);
   const [providerError, setProviderError] = useState('');
@@ -83,6 +82,7 @@ export function CallRecords({ initialSessionId, onCloseDetail }: { initialSessio
   selectedIdRef.current = selectedId;
 
   useEffect(() => { if (initialSessionId) setSelectedId(initialSessionId); }, [initialSessionId]);
+  useEffect(() => { setFilters(current => ({ ...current, grade: initialGrade ?? '', page: 1, ...(initialRange ? { from: localDate(new Date(initialRange.from)), to: localDate(new Date(Date.parse(initialRange.to) - 1)), range: 'custom' } : {}) })); }, [initialGrade, initialRange]);
   useEffect(() => { retryRequest.current++; setRetrying(false); }, [selectedId]);
   useEffect(() => {
     const timeout = window.setTimeout(() => setFilters(current => current.search === searchDraft.trim() ? current : { ...current, page: 1, search: searchDraft.trim() }), 300);

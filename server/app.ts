@@ -15,6 +15,7 @@ import { createSeedSession, SEED_MODEL } from './seed.js';
 import { DeepSeekClient } from './deepseek.js';
 import { AnalysisWorker } from './jobs.js';
 import { Recordings, RecordingError } from './recordings.js';
+import { readDashboard } from './dashboard.js';
 
 function localRequest(req: IncomingMessage) {
   const isLoopback = (name: string) => ['localhost', '127.0.0.1', '[::1]'].includes(name);
@@ -78,6 +79,16 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
     res.status(202).json(worker.status());
   });
   app.get('/api/analysis/status', (_req, res) => res.json(worker.status()));
+  app.get('/api/dashboard', (req, res) => {
+    const range = z.object({
+      from: z.iso.datetime({ offset: true }).transform(value => new Date(value).toISOString()),
+      to: z.iso.datetime({ offset: true }).transform(value => new Date(value).toISOString()),
+      offsetMinutes: z.coerce.number().int().min(-840).max(840).default(480),
+    }).parse(req.query);
+    const duration = Date.parse(range.to) - Date.parse(range.from);
+    if (duration <= 0 || duration > 93 * 86400000) { res.status(400).json({ error: '请选择不超过93天的有效统计范围' }); return; }
+    res.json({ ...readDashboard(store, range), jobs: store.jobCounts(), provider: { seedConfigured: Boolean(options.apiKey), analysisConfigured: worker.status().configured, model: worker.status().model } });
+  });
   app.get('/api/sessions', (req, res) => {
     const query = z.object({
       page: z.coerce.number().int().min(1).max(1000000).default(1), pageSize: z.coerce.number().int().min(1).max(100).default(20),
