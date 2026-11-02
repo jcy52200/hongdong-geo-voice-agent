@@ -1,4 +1,19 @@
+import { inputAudioConstraints, validateActualInput, validateAudioRouting, validateInputProcessing, type AudioRoutingOptions } from './audio-routing';
+
 export interface CallRecording { blob: Blob; mimeType: string }
+export interface AudioLevels { input: number; output: number }
+export interface LocalAudioOptions extends AudioRoutingOptions {
+  /** Disable recording for a local routing check, without opening a model session. */
+  record?: boolean;
+  onLevels?: (levels: AudioLevels) => void;
+  /** A selected device disappeared or the browser changed the pinned output. */
+  onFault?: (message: string) => void;
+}
+
+type RoutedAudioContext = AudioContext & {
+  setSinkId?: (id: string) => Promise<void>;
+  sinkId?: string | { type: string };
+};
 
 /** One isolated microphone, PCM playback queue, and mixed recording per local test. */
 export class LocalAudio {
@@ -20,36 +35,134 @@ export class LocalAudio {
   private resolveRecording?: (recording: CallRecording | null) => void;
   private recordingProblem?: string;
   private recordingStopTimer?: number;
+  private readonly options: LocalAudioOptions;
+  private inputMeter?: AnalyserNode;
+  private outputMeter?: AnalyserNode;
+  private levelTimer?: number;
+  private removeDeviceListeners?: () => void;
+  private prepared = false;
+  private preparing = false;
 
   get recordingError() { return this.recordingProblem; }
 
-  constructor() {
+  constructor(options: LocalAudioOptions = {}) {
+    this.options = { ...options };
     this.context = new AudioContext();
     // Called directly in the button's gesture, before awaiting any network request.
     this.resumed = this.context.resume();
   }
 
-  async prepare(onFrame: (base64: string) => void) {
-    await this.resumed;
-    if (this.disposed) return;
-    if (!navigator.mediaDevices?.getUserMedia) throw new Error('当前浏览器无法访问麦克风，请使用 localhost 或 HTTPS。');
-    this.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
-    if (this.disposed) { this.stream.getTracks().forEach(track => track.stop()); return; }
-    await this.context.audioWorklet.addModule('/capture-worklet.js');
-    if (this.disposed) return;
-    this.input = this.context.createMediaStreamSource(this.stream);
-    this.capture = new AudioWorkletNode(this.context, 'pcm16-capture');
-    this.capture.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
+  async prepare(onFrame: (base64: string) => void = () => {}) {
+    if (this.prepared || this.preparing) throw new Error('音频连接已经初始化。');
+    this.preparing = true;
+    try {
+      await this.resumed;
       if (this.disposed) return;
-      const bytes = new Uint8Array(event.data);
-      let binary = '';
-      for (const byte of bytes) binary += String.fromCharCode(byte);
-      onFrame(btoa(binary));
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('当前浏览器无法访问麦克风，请使用 localhost 或 HTTPS。');
+      if (this.options.mode === 'softphone') {
+        // Fail before asking for a microphone if the browser cannot pin output.
+        if (typeof (this.context as RoutedAudioContext).setSinkId !== 'function') {
+          throw new Error('当前浏览器不支持指定音频输出。软电话桥接需要支持 AudioContext.setSinkId 的桌面版 Chrome 或 Edge。');
+        }
+        // Also catches missing/default selections before any capture is opened.
+        if (!this.options.inputDeviceId || !this.options.outputDeviceId || ['default', 'communications'].includes(this.options.inputDeviceId) || ['default', 'communications'].includes(this.options.outputDeviceId)) {
+          throw new Error('软电话桥接必须分别选择明确的输入和输出设备，不能使用系统默认设备。');
+        }
+      }
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: inputAudioConstraints(this.options), video: false });
+      if (this.disposed) { this.stream.getTracks().forEach(track => track.stop()); return; }
+      const settings = this.stream.getAudioTracks()[0]?.getSettings() ?? {};
+      validateActualInput(this.options, settings.deviceId);
+      validateInputProcessing(this.options, settings);
+      if (this.options.inputDeviceId || this.options.outputDeviceId) {
+        validateAudioRouting(this.options, await navigator.mediaDevices.enumerateDevices());
+        if (this.disposed) return;
+      }
+      if (this.options.outputDeviceId) {
+        const context = this.context as RoutedAudioContext;
+        if (typeof context.setSinkId !== 'function') throw new Error('当前浏览器不支持指定音频输出，请使用桌面版 Chrome 或 Edge。');
+        await context.setSinkId(this.options.outputDeviceId);
+        if (this.disposed) return;
+        if (context.sinkId !== this.options.outputDeviceId) throw new Error('浏览器未能切换到所选输出设备，已停止音频连接。');
+      }
+      await this.context.audioWorklet.addModule('/capture-worklet.js');
+      if (this.disposed) return;
+      this.input = this.context.createMediaStreamSource(this.stream);
+      this.capture = new AudioWorkletNode(this.context, 'pcm16-capture');
+      this.capture.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
+        if (this.disposed) return;
+        const bytes = new Uint8Array(event.data);
+        let binary = '';
+        for (const byte of bytes) binary += String.fromCharCode(byte);
+        onFrame(btoa(binary));
+      };
+      this.silent = this.context.createGain();
+      this.silent.gain.value = 0;
+      this.input.connect(this.capture).connect(this.silent).connect(this.context.destination);
+      if (this.options.record !== false) this.prepareRecording();
+      if (this.options.onLevels) this.prepareMeters();
+      this.watchDevices();
+      this.prepared = true;
+    } catch (error) {
+      this.close();
+      throw error;
+    } finally {
+      this.preparing = false;
+    }
+  }
+
+  private prepareMeters() {
+    this.inputMeter = this.context.createAnalyser();
+    this.outputMeter = this.context.createAnalyser();
+    this.inputMeter.fftSize = this.outputMeter.fftSize = 256;
+    this.input!.connect(this.inputMeter);
+    this.outputMeter.connect(this.context.destination);
+    const inputData = new Float32Array(256);
+    const outputData = new Float32Array(256);
+    const rms = (meter: AnalyserNode, data: Float32Array<ArrayBuffer>) => {
+      meter.getFloatTimeDomainData(data);
+      return Math.min(1, Math.sqrt(data.reduce((sum, value) => sum + value * value, 0) / data.length));
     };
-    this.silent = this.context.createGain();
-    this.silent.gain.value = 0;
-    this.input.connect(this.capture).connect(this.silent).connect(this.context.destination);
-    this.prepareRecording();
+    this.levelTimer = window.setInterval(() => {
+      if (this.disposed) return;
+      this.options.onLevels?.({ input: rms(this.inputMeter!, inputData), output: rms(this.outputMeter!, outputData) });
+    }, 100);
+  }
+
+  private watchDevices() {
+    const fault = (message: string) => {
+      if (this.disposed) return;
+      this.close();
+      this.options.onFault?.(message);
+    };
+    const ended = () => fault('音频输入已断开，连接已停止。请检查虚拟声卡或麦克风。');
+    const track = this.stream!.getAudioTracks()[0];
+    if (!track || track.readyState === 'ended') throw new Error('所选音频输入已经断开。');
+    if (this.options.outputDeviceId && (this.context as RoutedAudioContext).sinkId !== this.options.outputDeviceId) {
+      throw new Error('浏览器没有保持所选输出设备，已停止音频连接。');
+    }
+    const changed = async () => {
+      if (this.disposed || (!this.options.inputDeviceId && !this.options.outputDeviceId)) return;
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        if (this.disposed) return;
+        validateAudioRouting(this.options, devices);
+        validateActualInput(this.options, track.getSettings().deviceId);
+      } catch (error) { fault(error instanceof Error ? error.message : '音频设备发生变化，请重新连接。'); }
+    };
+    const sinkChanged = () => {
+      if (this.options.outputDeviceId && (this.context as RoutedAudioContext).sinkId !== this.options.outputDeviceId) {
+        fault('浏览器改变了音频输出，连接已停止。请重新选择桥接输出设备。');
+      }
+    };
+    track.addEventListener('ended', ended);
+    navigator.mediaDevices.addEventListener('devicechange', changed);
+    this.context.addEventListener('sinkchange', sinkChanged);
+    this.removeDeviceListeners = () => {
+      track.removeEventListener('ended', ended);
+      navigator.mediaDevices.removeEventListener('devicechange', changed);
+      this.context.removeEventListener('sinkchange', sinkChanged);
+    };
   }
 
   private prepareRecording() {
@@ -132,7 +245,7 @@ export class LocalAudio {
     for (let index = 0; index < length; index++) channel[index] = view.getInt16(index * 2, true) / 32768;
     const source = this.context.createBufferSource();
     source.buffer = buffer;
-    source.connect(this.context.destination);
+    source.connect(this.outputMeter ?? this.context.destination);
     if (this.recordingDestination && this.recorder?.state === 'recording') source.connect(this.recordingDestination);
     source.onended = () => { source.disconnect(); this.sources.delete(source); };
     const start = Math.max(this.context.currentTime + 0.025, this.nextStart);
@@ -162,6 +275,8 @@ export class LocalAudio {
   close() {
     if (this.disposed) return;
     this.disposed = true;
+    this.removeDeviceListeners?.();
+    if (this.levelTimer) window.clearInterval(this.levelTimer);
     const recording = this.stopRecording();
     if (this.drainTimer) window.clearTimeout(this.drainTimer);
     this.setInputEnabled(false);
@@ -170,6 +285,8 @@ export class LocalAudio {
     this.capture?.disconnect();
     this.capture?.port.close();
     this.silent?.disconnect();
+    this.inputMeter?.disconnect();
+    this.outputMeter?.disconnect();
     this.clearPlayback();
     // Release the real microphone immediately. Keep only the isolated mix graph
     // alive until MediaRecorder has emitted its final buffered audio.

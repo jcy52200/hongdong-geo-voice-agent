@@ -103,7 +103,15 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
     res.json(store.listSessions(query));
   });
   app.post('/api/sessions', (req, res) => {
-    const { customerId, mode } = z.object({ customerId: z.string(), mode: z.enum(['simulation', 'seed']) }).parse(req.body);
+    const { customerId, mode, transport, bridgeConfirmed } = z.object({
+      customerId: z.string(), mode: z.enum(['simulation', 'seed']),
+      transport: z.enum(['browser', 'softphone_bridge']).default('browser'),
+      bridgeConfirmed: z.boolean().optional(),
+    }).superRefine((value, context) => {
+      if (value.transport !== 'softphone_bridge') return;
+      if (value.mode !== 'seed') context.addIssue({ code: 'custom', path: ['mode'], message: '软电话桥接仅支持SeedDuplex语音测试' });
+      if (value.bridgeConfirmed !== true) context.addIssue({ code: 'custom', path: ['bridgeConfirmed'], message: '请先人工确认软电话已接通，再启动AI；系统不会自动拨号或检测SIP状态' });
+    }).parse(req.body);
     const customer = store.customer(customerId);
     if (!customer) { res.status(404).json({ error: '客户不存在，请先导入客户资料' }); return; }
     if (mode === 'seed' && !options.apiKey) {
@@ -112,7 +120,7 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
     if (mode === 'seed' && store.config().modelOptions?.dialog?.extra?.enable_volc_websearch && !options.webSearchKey) {
       res.status(409).json({ error: '已开启联网搜索，请先在 .env 配置 SEED_WEBSEARCH_API_KEY 并重启，或关闭联网' }); return;
     }
-    res.status(201).json(store.createSession(customer, mode));
+    res.status(201).json(store.createSession(customer, mode, { transport, bridgeConfirmed }));
   });
   app.get('/api/sessions/:id', (req, res) => {
     const session = store.session(req.params.id);

@@ -15,3 +15,5 @@ coverage/
 *.log
 .DS_Store
 artifacts/
+output/playwright/
+.playwright-cli/

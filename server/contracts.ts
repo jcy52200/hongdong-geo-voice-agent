@@ -1,6 +1,6 @@
 // Versioned interfaces for the local workbench and the future SIP gateway.
 export const INTEGRATION_CONTRACTS = {
-  version: '2.0',
+  version: '2.1',
   crm: {
     status: 'json_import_ready', endpoint: 'POST /api/customers/import',
     body: { customers: [{ camp: '客户公司', name: '联系人', phone: '字符串号码', address: '城市/地址', industry: '可选行业' }] },
@@ -17,6 +17,18 @@ export const INTEGRATION_CONTRACTS = {
     openingLock: '网关必须在真实播放排空后发送 playback_done；收到音频done不等于客户已听完',
     isolation: '一通电话一个模型WebSocket、独立缓冲与prompt快照；电话音频直接走网关，不走扬声器',
   },
+  softphoneBridge: {
+    status: 'implemented', implemented: true, purpose: '仅用于人工软电话测试与效果演示，不替代未来FreeSWITCH SIP拨号模块',
+    endpoint: 'POST /api/sessions',
+    body: { customerId: 'UUID', mode: 'seed', transport: 'softphone_bridge', bridgeConfirmed: true },
+    mediaEndpoint: '/ws/sessions/:id',
+    media: { input: 'PCM16LE mono 16000 Hz, 20 ms / 640 bytes', output: 'PCM16LE mono 24000 Hz' },
+    routing: '浏览器选择独立输入、输出虚拟设备；Linphone负责真实电话，浏览器仅传递音频并复用现有SeedDuplex会话',
+    signaling: '无SIP信令、无自动拨号或接通/挂机检测；需人工拨号、确认接通后启动AI，并分别结束AI与软电话',
+    answerTime: 'answeredAt仍为SeedDuplex初始化成功时间，不表示运营商接通时间；会话持久化transport并记录人工确认的本地事件',
+    recording: '浏览器录音只包含进入模型的输入与实际播放的AI音频，不等同运营商原始线路录音',
+    compatibility: '省略transport默认browser；旧记录迁移为browser；simulation不支持softphone_bridge；freeswitch仍为reserved',
+  },
   analysis: {
     status: 'implemented', implemented: true, queueTable: 'analysis_jobs',
     model: 'deepseek-flash / DeepSeek V4.1 Flash',
@@ -28,7 +40,7 @@ export const INTEGRATION_CONTRACTS = {
       summary: 'string', evidence: [{ transcriptId: 'UUID', quote: '客户原话' }], needsHumanReview: true,
     },
     endpoints: ['GET /api/analysis/status', 'GET /api/sessions', 'POST /api/sessions/:id/analyze', 'GET /api/sessions/:id/recording'],
-    gatewayBoundary: '当前接通表示 SeedDuplex 语音试打初始化成功；接入SIP后必须以真实 call.answered 更新 answeredAt，并提供独立线路录音。',
+    gatewayBoundary: '当前接通表示 SeedDuplex 语音试打初始化成功，softphone_bridge仅人工确认电话接通；接入FreeSWITCH SIP后必须以真实 call.answered 更新 answeredAt，并提供独立线路录音。',
     note: '结果附客户原话证据；A需许可和已确认微信联系方式，B至少两轮有效回应；不以时长评分。无密钥保留pending，失败最多尝试3次后支持手动重试。',
   },
 };

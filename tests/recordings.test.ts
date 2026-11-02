@@ -52,13 +52,19 @@ function fakeMedia(t: test.TestContext, microphone?: Promise<unknown>) {
     connect(target: Node) { this.connections.push(target); return target; }
     disconnect() { this.connections = []; }
   }
-  const microphoneTrack = { stopped: false, stop() { this.stopped = true; } };
-  const mixTrack = { stopped: false, stop() { this.stopped = true; } };
-  const mic = { getTracks: () => [microphoneTrack] };
+  class Track extends EventTarget {
+    stopped = false;
+    readyState = 'live';
+    getSettings() { return { deviceId: 'test-microphone', echoCancellation: true, noiseSuppression: true, autoGainControl: true }; }
+    stop() { this.stopped = true; this.readyState = 'ended'; }
+  }
+  const microphoneTrack = new Track();
+  const mixTrack = new Track();
+  const mic = { getTracks: () => [microphoneTrack], getAudioTracks: () => [microphoneTrack] };
   const input = new Node();
   const gainNodes: Array<Node & { gain: { value: number } }> = [];
   const destination = Object.assign(new Node(), { stream: { getTracks: () => [mixTrack] }, channelCount: 2 });
-  class Context {
+  class Context extends EventTarget {
     state = 'running';
     destination = new Node();
     currentTime = 0;
@@ -94,7 +100,7 @@ function fakeMedia(t: test.TestContext, microphone?: Promise<unknown>) {
   }
   const globals: Record<string, unknown> = {
     AudioContext: Context, AudioWorkletNode: Worklet, MediaRecorder: Recorder,
-    navigator: { mediaDevices: { getUserMedia: () => microphone ?? Promise.resolve(mic) } },
+    navigator: { mediaDevices: Object.assign(new EventTarget(), { getUserMedia: () => microphone ?? Promise.resolve(mic) }) },
     window: { setTimeout, clearTimeout },
   };
   for (const [name, value] of Object.entries(globals)) {

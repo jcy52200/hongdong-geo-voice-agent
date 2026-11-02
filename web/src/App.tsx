@@ -1,6 +1,8 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { api, messageOf } from './api';
 import { LocalAudio } from './audio';
+import { SoftphoneBridge, loadBridgeRoute, type BridgeHandle, type BridgeRoute } from './SoftphoneBridge';
+import type { AudioLevels } from './audio';
 const PromptControl = lazy(() => import('./PromptControl').then(module => ({ default: module.PromptControl })));
 const CallRecords = lazy(() => import('./CallRecords').then(module => ({ default: module.CallRecords })));
 const Dashboard = lazy(() => import('./Dashboard').then(module => ({ default: module.Dashboard })));
@@ -62,6 +64,13 @@ export default function App() {
   const [saving, setSaving] = useState(false);
   const [customerId, setCustomerId] = useState('');
   const [mode, setMode] = useState<'simulation' | 'seed'>('seed');
+  const [transport, setTransport] = useState<'browser' | 'softphone_bridge'>('browser');
+  const [bridgeRoute, setBridgeRoute] = useState<BridgeRoute>(loadBridgeRoute);
+  const [bridgeReady, setBridgeReady] = useState(false);
+  const [bridgeConfirmed, setBridgeConfirmed] = useState(false);
+  const [bridgeLevels, setBridgeLevels] = useState<AudioLevels>({ input: 0, output: 0 });
+  const [bridgeHangupReminder, setBridgeHangupReminder] = useState(false);
+  const bridgeRef = useRef<BridgeHandle>(null);
   const [live, setLive] = useState<Session | null>(null);
   const [viewed, setViewed] = useState<Session | null>(null);
   const [recordsGrade, setRecordsGrade] = useState<Grade | undefined>();
@@ -159,6 +168,9 @@ export default function App() {
     const sessionId = recordingOwnerRef.current;
     audioRef.current = null;
     recordingOwnerRef.current = null;
+    setBridgeReady(false);
+    setBridgeConfirmed(false);
+    setBridgeLevels({ input: 0, output: 0 });
     if (audio) {
       const recording = audio.stopRecording();
       audio.close();
@@ -184,9 +196,13 @@ export default function App() {
 
   useEffect(() => {
     void refresh();
-    const onLeave = () => { const ws = wsRef.current; if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'finish' })); release(); };
+    const onLeave = () => {
+      generation.current++;
+      bridgeRef.current?.stopPreview(); setBridgeReady(false); setBridgeConfirmed(false); setBusy(false);
+      const ws = wsRef.current; if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'finish' })); release();
+    };
     window.addEventListener('pagehide', onLeave);
-    return () => { generation.current++; window.removeEventListener('pagehide', onLeave); onLeave(); };
+    return () => { window.removeEventListener('pagehide', onLeave); onLeave(); };
   }, [refresh, release]);
   useEffect(() => { if (!notice) return; const timer = window.setTimeout(() => setNotice(''), 5000); return () => window.clearTimeout(timer); }, [notice]);
   useEffect(() => { if (!preview) return; const close = (event: KeyboardEvent) => { if (event.key === 'Escape') setPreview(null); }; window.addEventListener('keydown', close); return () => window.removeEventListener('keydown', close); }, [preview]);
@@ -238,21 +254,35 @@ export default function App() {
 
   async function startSession() {
     if (!selectedCustomer || inProgress) return;
+    const bridge = mode === 'seed' && transport === 'softphone_bridge';
+    if (bridge && (!bridgeReady || !bridgeConfirmed)) { setError('请先检查音频路由，并确认 Linphone 已接通测试手机。'); return; }
+    bridgeRef.current?.stopPreview();
+    if (bridge) setBridgeHangupReminder(true);
     setBusy(true); setError(''); setNotice(''); setMuted(false); mutedRef.current = false;
     openingRef.current = true; setOpeningLocked(true);
     const run = ++generation.current;
     // AudioContext is created and resumed synchronously inside this user gesture.
     let audio: LocalAudio | null = null;
     let created: Session | null = null;
+    let audioFailure: ((message: string) => void) | undefined;
     try {
-      audio = mode === 'seed' ? new LocalAudio() : null;
+      audio = mode === 'seed' ? new LocalAudio(bridge ? {
+        mode: 'softphone', ...bridgeRoute,
+        onLevels: levels => { if (run === generation.current) setBridgeLevels(levels); },
+        onFault: message => {
+          if (run !== generation.current) return;
+          setBridgeReady(false);
+          if (audioFailure) audioFailure(message);
+          else { setError(message); void finishSession(); }
+        },
+      } : {}) : null;
       audioRef.current = audio;
       if (audio) await audio.prepare(frame => {
         const ws = wsRef.current;
         if (run === generation.current && !openingRef.current && !mutedRef.current && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'audio', audio: frame }));
       });
       if (run !== generation.current) return;
-      created = await api<Session>('/sessions', { customerId: selectedCustomer.id, mode });
+      created = await api<Session>('/sessions', { customerId: selectedCustomer.id, mode, transport: bridge ? 'softphone_bridge' : 'browser', ...(bridge ? { bridgeConfirmed: true } : {}) });
       if (run !== generation.current) { void api<Session>(`/sessions/${created.id}/finish`, {}).then(saveSessionHistory).catch(() => undefined); return; }
       updateSession(created);
       recordingOwnerRef.current = audio ? created.id : null;
@@ -276,6 +306,7 @@ export default function App() {
         else ws.addEventListener('close', readFinal, { once: true });
         release();
       };
+      audioFailure = fail;
       connectionTimer.current = window.setTimeout(() => fail('连接超时，请检查服务和火山引擎配置后重试。'), 20000);
       ws.onopen = () => { if (run !== generation.current || liveRef.current?.id !== sessionId || wsRef.current !== ws) return; if (connectionTimer.current) window.clearTimeout(connectionTimer.current); setBusy(false); };
       ws.onerror = () => fail('语音连接失败，请检查本地服务是否正常运行。');
@@ -338,6 +369,11 @@ export default function App() {
     const sessionId = current.id;
     try { const session = await api<Session>(`/sessions/${sessionId}/finish`, {}); if (applySnapshot(session, run, sessionId)) void refresh(true); }
     catch (reason) { if (run === generation.current && liveRef.current?.id === sessionId) setError(messageOf(reason)); }
+  }
+
+  function chooseTest(nextMode: 'simulation' | 'seed', nextTransport: 'browser' | 'softphone_bridge' = 'browser') {
+    bridgeRef.current?.stopPreview(); setBridgeReady(false); setBridgeConfirmed(false);
+    setMode(nextMode); setTransport(nextTransport);
   }
 
   function sendText(value = text) {
@@ -412,28 +448,29 @@ export default function App() {
         {failedRecordings.map(item => <div className="alert error" role="alert" key={item.sessionId}><p>录音保存失败（{item.sessionId.slice(0, 8)}）：{item.error}。音频仍保留在本页，请重试保存或先下载备份。</p><button className="text-button" onClick={() => void retryRecording(item)}>重试保存</button><button className="text-button" onClick={() => downloadPendingRecording(item)}>下载备份</button></div>)}
         {recordingsSaving > 0 && <div className="alert" role="status"><p>正在保存 {recordingsSaving} 通录音，请保持页面打开。</p></div>}
         {notice && <div className="alert success" role="status"><span>✓</span><p>{notice}</p><button aria-label="关闭提示" onClick={() => setNotice('')}><X size={17} /></button></div>}
+        {bridgeHangupReminder && <div className="bridge-reminder" role="status"><p>软电话演示：本页只控制 AI。结束 AI 或连接失败后，请另在 Linphone 挂机；对方先挂机时，也请及时结束 AI 会话。</p>{!inProgress && <button className="text-button" onClick={() => setBridgeHangupReminder(false)}>已在 Linphone 挂机</button>}</div>}
         {loading && !data ? <div className="loading-layout" aria-label="正在加载工作台"><div /><div /><div /></div> : !data ? <div className="panel"><Empty title="暂时无法连接本地服务" detail="请确认后端已启动，然后点击刷新数据。" /></div> : <>
           {page === 'dashboard' && <Suspense fallback={pageFallback}><Dashboard refreshKey={dashboardRevision} onNavigate={setPage} onOpenSession={id => { setViewed({ id } as Session); setRecordsGrade(undefined); setPage('sessions'); }} onGrade={(grade, range) => { setViewed(null); setRecordsGrade(grade); setRecordsRange(range); setPage('sessions'); }} /></Suspense>}
 
           {page === 'voice' && <>
             <div className="overview-strip"><div><span className="overview-icon"><UsersThree size={24} /></span><div><small>可测试客户</small><strong>{data.customers.length}<em>位</em></strong></div></div><div><span className="overview-icon"><ListChecks size={24} /></span><div><small>已保存会话</small><strong>{data.sessionTotal ?? data.sessions.length}<em>通</em></strong></div></div><div className="provider-overview"><span className={`provider-light ${data.provider.configured ? 'ready' : ''}`} /><div><small>SeedDuplex 语音服务</small><strong className="provider-value">{data.provider.configured ? '已配置密钥' : '待配置 API Key'}</strong></div><span className="subtle-tag">{data.provider.model}</span></div></div>
             {config && JSON.stringify(config) !== JSON.stringify(data.config) && <div className="alert prompt-draft-notice"><p>限制词或模型参数有未保存修改，试打将沿用已保存版本。</p><button className="text-button" onClick={() => setPage('prompt')}>去保存 →</button></div>}
-            <div className="workbench-grid"><section className="panel test-settings"><div className="panel-heading"><h2>模拟电话设置</h2><span className="subtle-tag">单通隔离</span></div><div className="panel-body"><label className="field">客户资料<select value={customerId} onChange={event => setCustomerId(event.target.value)} disabled={inProgress}><option value="" disabled>请选择客户</option>{data.customers.map(customer => <option key={customer.id} value={customer.id}>{customer.name} · {customer.camp}</option>)}</select></label>
+            <div className={`workbench-grid ${mode === 'seed' && transport === 'softphone_bridge' ? 'bridge-workbench' : ''}`}><section className="panel test-settings"><div className="panel-heading"><h2>模拟电话设置</h2><span className="subtle-tag">单通隔离</span></div><div className="panel-body"><label className="field">客户资料<select value={customerId} onChange={event => setCustomerId(event.target.value)} disabled={inProgress}><option value="" disabled>请选择客户</option>{data.customers.map(customer => <option key={customer.id} value={customer.id}>{customer.name} · {customer.camp}</option>)}</select></label>
               {selectedCustomer ? <div className="customer-summary"><div className="customer-summary-head"><span className="company-avatar">{selectedCustomer.camp.slice(0, 1)}</span><div><strong>{selectedCustomer.camp}</strong><span>{selectedCustomer.industry || '行业未指定'}</span></div></div><dl><div><dt>客户</dt><dd>{selectedCustomer.name}</dd></div><div><dt>电话</dt><dd className="mono">{selectedCustomer.phone}</dd></div><div><dt>地区</dt><dd>{selectedCustomer.address}</dd></div></dl></div> : <div className="inline-empty">还没有客户资料。<button className="text-button" onClick={() => setPage('customers')}>添加客户 →</button></div>}
               <button className="text-button demo-call-button" disabled={inProgress || saving} onClick={() => void useDemoCustomer()}>使用虚构示例客户</button>
-              <div className="field"><span>测试方式</span><div className="mode-options"><button className={mode === 'simulation' ? 'chosen' : ''} onClick={() => setMode('simulation')} disabled={inProgress}><strong>文字预演</strong><small>规则流程 · 无需密钥</small></button><button className={mode === 'seed' ? 'chosen' : ''} onClick={() => setMode('seed')} disabled={inProgress}><strong>语音试打</strong><small>SeedDuplex · 麦克风</small></button></div></div>
-              <details className="test-note voice-help"><summary>{mode === 'simulation' ? '先验证流程与记录' : '使用浏览器麦克风测试'}</summary><p>{mode === 'simulation' ? '这是本地规则模拟，不代表 SeedDuplex 的音色、自然度或模型能力。' : '点击连接后授权麦克风。开场完整播放后，才会向模型发送您的语音。建议使用耳机。'}</p></details>
+              <div className="field"><span>测试方式</span><div className="mode-options voice-test-modes"><button className={mode === 'simulation' ? 'chosen' : ''} onClick={() => chooseTest('simulation')} disabled={inProgress}><strong>文字预演</strong><small>规则流程 · 无需密钥</small></button><button className={mode === 'seed' && transport === 'browser' ? 'chosen' : ''} onClick={() => chooseTest('seed')} disabled={inProgress}><strong>浏览器试听</strong><small>SeedDuplex · 麦克风</small></button><button className={mode === 'seed' && transport === 'softphone_bridge' ? 'chosen' : ''} onClick={() => chooseTest('seed', 'softphone_bridge')} disabled={inProgress}><strong>软电话桥接（演示）</strong><small>Linphone · 双向虚拟音频</small></button></div></div>
+              {mode === 'seed' && transport === 'softphone_bridge' ? <SoftphoneBridge ref={bridgeRef} value={bridgeRoute} onChange={setBridgeRoute} ready={bridgeReady} onReady={setBridgeReady} confirmed={bridgeConfirmed} onConfirm={setBridgeConfirmed} disabled={inProgress} levels={bridgeLevels} /> : <details className="test-note voice-help"><summary>{mode === 'simulation' ? '先验证流程与记录' : '使用浏览器麦克风测试'}</summary><p>{mode === 'simulation' ? '这是本地规则模拟，不代表 SeedDuplex 的音色、自然度或模型能力。' : '点击连接后授权麦克风。开场完整播放后，才会向模型发送您的语音。建议使用耳机。'}</p></details>}
               {mode === 'seed' && !data.provider.configured && <p className="config-warning">请先在服务端 .env 配置火山引擎 API Key。</p>}
-              {inProgress ? <button className="button danger full" onClick={() => void finishSession()}><PhoneDisconnect size={18} />{busy ? '取消连接' : '结束本次测试'}</button> : <button className="button primary full" onClick={() => void startSession()} disabled={!selectedCustomer || (mode === 'seed' && !data.provider.configured)}>{mode === 'seed' ? <><PhoneCall size={18} />开始模拟电话<ArrowUpRight size={16} /></> : <><Play size={17} />开始文字预演</>}</button>}
-              <button className="button plain full preview-button" onClick={() => void showPrompt()} disabled={!selectedCustomer || saving}>查看本通提示词 ↗</button><div className="privacy-note">仅测试语音，不会拨打客户电话</div>
+              {inProgress ? <button className="button danger full" onClick={() => void finishSession()}><PhoneDisconnect size={18} />{busy ? '取消连接' : live?.transport === 'softphone_bridge' ? '结束 AI 会话' : '结束本次测试'}</button> : <button className="button primary full" onClick={() => void startSession()} disabled={!selectedCustomer || (mode === 'seed' && (!data.provider.configured || (transport === 'softphone_bridge' && (!bridgeReady || !bridgeConfirmed))))}>{mode === 'seed' ? <><PhoneCall size={18} />{transport === 'softphone_bridge' ? '接通后启动 AI' : '开始模拟电话'}<ArrowUpRight size={16} /></> : <><Play size={17} />开始文字预演</>}</button>}
+              <button className="button plain full preview-button" onClick={() => void showPrompt()} disabled={!selectedCustomer || saving}>查看本通提示词 ↗</button><div className="privacy-note">{mode === 'seed' && transport === 'softphone_bridge' ? '拨号与挂机由 Linphone 人工操作' : '仅测试语音，不会拨打客户电话'}</div>
             </div></section>
-              <section className="panel conversation-panel"><div className="panel-heading"><div className="heading-with-subtitle"><h2>电话对话</h2><span>{live ? `${live.customer.name} · ${live.mode === 'seed' ? 'SeedDuplex 语音' : '规则文字模拟'}` : '等待发起测试'}</span></div><div className="call-status"><time className="call-timer mono">{String(Math.floor(callSeconds / 60)).padStart(2, '0')}:{String(callSeconds % 60).padStart(2, '0')}</time>{live ? <Badge status={live.status} /> : <span className="badge idle"><i />未连接</span>}</div></div>
-                <div className="conversation-note"><span className="note-dot" />{inProgress ? openingLocked ? '智能体先开场，首句播放期间客户输入已锁定。' : live?.mode === 'seed' ? muted ? '麦克风已静音，智能体仍可继续播放。' : '麦克风已开启，可以自然说话并打断后续回复。' : '开场已完成，可以输入客户回复。' : '每通会话独立保存，结束后可在通话记录中回看。'}</div>
+              <section className="panel conversation-panel"><div className="panel-heading"><div className="heading-with-subtitle"><h2>电话对话</h2><span>{live ? `${live.customer.name} · ${live.transport === 'softphone_bridge' ? '软电话演示 · AI 会话时间' : live.mode === 'seed' ? 'SeedDuplex 语音' : '规则文字模拟'}` : '等待发起测试'}</span></div><div className="call-status"><time className="call-timer mono">{String(Math.floor(callSeconds / 60)).padStart(2, '0')}:{String(callSeconds % 60).padStart(2, '0')}</time>{live ? <Badge status={live.status} /> : <span className="badge idle"><i />未连接</span>}</div></div>
+                <div className="conversation-note"><span className="note-dot" />{inProgress ? openingLocked ? '智能体先开场，首句播放期间客户输入已锁定。' : live?.mode === 'seed' ? muted ? '客户输入已暂停，智能体仍可继续播放。' : live.transport === 'softphone_bridge' ? '正在接收虚拟通道中的客户声音；电话状态请查看 Linphone。' : '麦克风已开启，可以自然说话并打断后续回复。' : '开场已完成，可以输入客户回复。' : '每通会话独立保存，结束后可在通话记录中回看。'}</div>
                 <TranscriptList transcripts={live?.transcripts ?? []} />
-                {live?.mode === 'seed' && connected ? <div className="voice-controls"><div className={`mic-indicator ${openingLocked || muted ? 'muted' : 'listening'}`}><span />{openingLocked ? '开场期间输入锁定' : muted ? '麦克风已静音' : '正在聆听您的声音'}</div><button className="button secondary small" onClick={toggleMute}>{muted ? <MicrophoneSlash size={17} /> : <Microphone size={17} />}{muted ? '开启麦克风' : '静音麦克风'}</button></div> : <div className="composer-area"><div className="quick-replies">{['您具体是做什么的？', '怎么收费？', '可以，发个案例看看。'].map(value => <button key={value} disabled={!connected || openingLocked || live?.mode !== 'simulation'} onClick={() => sendText(value)}>{value}</button>)}</div><form className="text-composer" onSubmit={event => { event.preventDefault(); sendText(); }}><input aria-label="输入客户回复" placeholder={connected && !openingLocked ? '以客户身份回复，按 Enter 发送…' : '开始文字模拟后，输入客户回复…'} value={text} onChange={event => setText(event.target.value)} disabled={!connected || openingLocked || live?.mode !== 'simulation'} /><button className="button primary" type="submit" disabled={!connected || openingLocked || !text.trim() || live?.mode !== 'simulation'}>发送 ↑</button></form></div>}
+                {live?.mode === 'seed' && connected ? <div className="voice-controls"><div className={`mic-indicator ${openingLocked || muted ? 'muted' : 'listening'}`}><span />{openingLocked ? '开场期间输入锁定' : muted ? '客户输入已暂停' : live.transport === 'softphone_bridge' ? '正在聆听客户通道' : '正在聆听您的声音'}</div><button className="button secondary small" onClick={toggleMute}>{muted ? <MicrophoneSlash size={17} /> : <Microphone size={17} />}{muted ? '恢复客户输入' : '暂停客户输入'}</button></div> : <div className="composer-area"><div className="quick-replies">{['您具体是做什么的？', '怎么收费？', '可以，发个案例看看。'].map(value => <button key={value} disabled={!connected || openingLocked || live?.mode !== 'simulation'} onClick={() => sendText(value)}>{value}</button>)}</div><form className="text-composer" onSubmit={event => { event.preventDefault(); sendText(); }}><input aria-label="输入客户回复" placeholder={connected && !openingLocked ? '以客户身份回复，按 Enter 发送…' : '开始文字模拟后，输入客户回复…'} value={text} onChange={event => setText(event.target.value)} disabled={!connected || openingLocked || live?.mode !== 'simulation'} /><button className="button primary" type="submit" disabled={!connected || openingLocked || !text.trim() || live?.mode !== 'simulation'}>发送 ↑</button></form></div>}
               </section></div>
 
-            <div className="section-heading"><h2>最近会话</h2><button className="text-button" onClick={() => setPage('sessions')}>全部记录 →</button></div><section className="panel">{data.sessions.length ? <div className="table-wrap"><table><thead><tr><th>客户 / 公司</th><th>测试方式</th><th>开始时间</th><th>状态</th><th>记录</th></tr></thead><tbody>{data.sessions.slice(0, 4).map(session => <tr key={session.id}><td><strong>{session.customer.name}</strong><small>{session.customer.camp}</small></td><td>{session.mode === 'seed' ? 'SeedDuplex 语音' : '规则文字模拟'}</td><td className="mono">{dateText(session.createdAt)}</td><td><Badge status={session.status} /></td><td><button className="text-button" onClick={() => void openSession(session)}>查看 →</button></td></tr>)}</tbody></table></div> : <div className="empty-row">暂无会话记录。完成第一通测试后，会自动保存在这里。</div>}</section>
+            <div className="section-heading"><h2>最近会话</h2><button className="text-button" onClick={() => setPage('sessions')}>全部记录 →</button></div><section className="panel">{data.sessions.length ? <div className="table-wrap"><table><thead><tr><th>客户 / 公司</th><th>测试方式</th><th>开始时间</th><th>状态</th><th>记录</th></tr></thead><tbody>{data.sessions.slice(0, 4).map(session => <tr key={session.id}><td><strong>{session.customer.name}</strong><small>{session.customer.camp}</small></td><td>{session.transport === 'softphone_bridge' ? '软电话演示' : session.mode === 'seed' ? 'SeedDuplex 语音' : '规则文字模拟'}</td><td className="mono">{dateText(session.createdAt)}</td><td><Badge status={session.status} /></td><td><button className="text-button" onClick={() => void openSession(session)}>查看 →</button></td></tr>)}</tbody></table></div> : <div className="empty-row">暂无会话记录。完成第一通测试后，会自动保存在这里。</div>}</section>
           </>}
 
           {page === 'prompt' && config && <Suspense fallback={pageFallback}><PromptControl session={live} searchConfigured={Boolean(data.provider.webSearchConfigured)} config={config} savedConfig={data.config} customers={data.customers} customerId={customerId} saving={saving} onChange={setConfig} onCustomerChange={setCustomerId} onSave={saveConfig} onPreview={() => showPrompt(true)} onError={setError} /></Suspense>}
@@ -441,6 +478,8 @@ export default function App() {
           {page === 'customers' && <><div className="customer-import-grid"><form className="panel" onSubmit={event => { event.preventDefault(); void importCustomers([{ ...customerForm, id: crypto.randomUUID() }]); }}><div className="panel-heading"><h2>添加客户</h2><button type="button" className="text-button" onClick={() => setCustomerForm(demoCustomer)}>填入示例</button></div><div className="panel-body"><div className="two-fields"><label className="field">公司名称 <em>*</em><input required value={customerForm.camp} onChange={event => setCustomerForm({ ...customerForm, camp: event.target.value })} placeholder="客户公司全称" /></label><label className="field">客户姓名 <em>*</em><input required value={customerForm.name} onChange={event => setCustomerForm({ ...customerForm, name: event.target.value })} placeholder="例如：王先生" /></label><label className="field">客户电话 <em>*</em><input required type="tel" value={customerForm.phone} onChange={event => setCustomerForm({ ...customerForm, phone: event.target.value })} placeholder="手机或固定电话" /></label><label className="field">客户地址 <em>*</em><input required value={customerForm.address} onChange={event => setCustomerForm({ ...customerForm, address: event.target.value })} placeholder="省 / 市 / 区域" /></label></div><label className="field">所属行业 <span className="optional">选填</span><input value={customerForm.industry} onChange={event => setCustomerForm({ ...customerForm, industry: event.target.value })} placeholder="用于更准确地讲解行业案例" /></label><button className="button primary" disabled={saving} type="submit">{saving ? '保存中…' : '添加到客户列表'}</button></div></form><section className="panel"><div className="panel-heading"><h2>批量导入 JSON</h2><label className="text-button file-picker">选择文件<input type="file" accept=".json,application/json" onChange={event => { const file = event.target.files?.[0]; if (file) void file.text().then(setImportText).catch(reason => setError(messageOf(reason))); event.target.value = ''; }} /></label></div><div className="panel-body"><label className="field"><span>客户列表</span><textarea className="mono import-text" rows={8} placeholder={'[\n  {\n    "camp": "客户公司",\n    "name": "王先生",\n    "phone": "13800000000",\n    "address": "河北省石家庄市"\n  }\n]'} value={importText} onChange={event => setImportText(event.target.value)} /></label><div className="form-actions"><button className="button secondary" disabled={saving || !importText.trim()} onClick={parseImport}>{saving ? '导入中…' : '校验并导入'}</button><small>支持数组或 {`{ customers: […] }`} 格式</small></div></div></section></div><div className="section-heading"><h2>客户列表 <span className="count">{data.customers.length}</span></h2><input className="search-input" aria-label="搜索客户" value={search} onChange={event => setSearch(event.target.value)} placeholder="搜索姓名、公司或电话" /></div><section className="panel customer-directory business-surface">{filteredCustomers.length ? <div className="table-wrap"><table><thead><tr><th>公司名称</th><th>客户姓名</th><th>客户电话</th><th>地址 / 行业</th><th /></tr></thead><tbody>{filteredCustomers.map(customer => <tr key={customer.id}><td><strong>{customer.camp}</strong></td><td>{customer.name}</td><td className="mono">{customer.phone}</td><td>{customer.address}<small>{customer.industry || (customer.industryStatus === 'failed' ? '补全失败，可重试' : customer.industryStatus === 'running' ? '正在分析行业…' : '待补全行业')}{customer.industryError && <span title={customer.industryError}> · !</span>}</small></td><td><button className="text-button" disabled={inProgress} onClick={() => { setCustomerId(customer.id); setPage('voice'); }}>带入测试 →</button></td></tr>)}</tbody></table></div> : <Empty title={search ? '没有匹配的客户' : '添加第一位客户'} detail={search ? '尝试搜索其他姓名、公司或电话。' : '手动添加一位客户，或导入 CRM 导出的 JSON 列表。'} />}</section></>}
 
           {page === 'sessions' && <Suspense fallback={pageFallback}><CallRecords initialRange={recordsRange} initialGrade={recordsGrade} initialSessionId={viewed?.id} onCloseDetail={() => setViewed(null)} /></Suspense>}
+
+          {page === 'integrations' && <section className="panel softphone-integration"><div className="panel-heading"><h2>软电话桥接演示</h2><span className="subtle-tag">可选测试入口</span></div><div className="panel-body"><p className="body-muted">使用 Linphone 和两条独立虚拟音频通道，把真实电话接到现有智能体。拨号与挂机由人工操作，FreeSWITCH + SIP 正式接入继续保留。</p><button className="button secondary" style={{ marginTop: 15 }} onClick={() => { if (!inProgress) chooseTest('seed', 'softphone_bridge'); setPage('voice'); }}>打开软电话演示 →</button></div></section>}
 
           {page === 'integrations' && <><div className="integration-flow"><div><span className="integration-step">01</span><h2>拨号系统</h2><span className="badge reserved">预留接入</span><p>CRM 客户导入、任务编排、FreeSWITCH 集群与云 SIP 路线。</p></div><span className="integration-arrow">→</span><div className="current"><span className="integration-step">02</span><h2>语音智能体</h2><span className="badge status-active"><i />当前实现</span><p>SeedDuplex 实时会话、逐通客户变量、首句输入门控及文字记录。</p></div><span className="integration-arrow">→</span><div><span className="integration-step">03</span><h2>意向分析</h2><span className="badge status-active">已实现</span><p>DeepSeek 4.1 Flash 自动补全行业、评估 A–G 意向等级，提取微信联系方式。</p></div></div><section className="panel"><div className="panel-heading"><h2>SeedDuplex 接入状态</h2><span className={`badge ${data.provider.configured ? 'status-active' : 'reserved'}`}>{data.provider.configured ? '已配置' : '待配置'}</span></div><div className="panel-body"><dl className="integration-spec"><div><dt>模型版本</dt><dd className="mono">{data.provider.model}</dd></div><div><dt>通信协议</dt><dd className="mono">{data.provider.protocol}</dd></div><div><dt>浏览器输入</dt><dd>PCM S16LE · 16 kHz · 单声道 · 20 ms / 帧</dd></div><div><dt>语音输出</dt><dd>PCM S16LE · 24 kHz · 隔离播放队列</dd></div><div><dt>会话边界</dt><dd>一位客户对应独立会话与提示词快照</dd></div></dl><a className="text-button" href="https://docs.volcengine.com/docs/doubao-voice/end-to-end-real-time-voice-full-duplex-version?lang=zh" target="_blank" rel="noreferrer">SeedDuplex 官方文档 ↗</a></div></section><section className="panel contracts-panel"><div className="panel-heading"><h2>预留接口契约</h2><button className="button secondary small" onClick={() => { void api('/integrations/contracts').then(setContracts).catch(reason => setError(messageOf(reason))); }}>读取接口契约</button></div>{contracts ? <pre className="contract-code">{JSON.stringify(contracts, null, 2)}</pre> : <div className="panel-body"><p className="body-muted">拨号侧可提供客户与通话标识，语音侧输出逐句 ASR / Chat 记录；分析侧接收已结束会话。点击读取查看后端定义的接口结构。</p></div>}</section></>}
         </>}

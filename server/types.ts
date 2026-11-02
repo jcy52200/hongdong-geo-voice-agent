@@ -2,6 +2,7 @@ import type { AgentConfig, Customer } from './prompt.js';
 import type { AnalysisStatus, CallAnalysis } from '../shared/analysis.js';
 export type { AgentConfig, Customer } from './prompt.js';
 export type SessionStatus = 'created' | 'connecting' | 'opening' | 'active' | 'completed' | 'failed';
+export type SessionTransport = 'browser' | 'softphone_bridge';
 export interface Transcript {
   id: string;
   eventId?: string;
@@ -15,9 +16,11 @@ export interface Session {
   customer: Customer;
   configSnapshot: AgentConfig;
   mode: 'simulation' | 'seed';
+  transport: SessionTransport;
   status: SessionStatus;
   createdAt: string;
   endedAt?: string;
+  /** Current browser/bridge sessions use AI initialization time, not a SIP answer event. */
   answeredAt?: string;
   endReason?: string;
   prompt: string;
