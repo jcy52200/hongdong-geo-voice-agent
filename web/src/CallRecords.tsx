@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { CaretDown, MagnifyingGlass } from '@phosphor-icons/react';
 import { GRADES, GRADE_LABELS, type Grade } from '../../shared/analysis';
 import { api, messageOf } from './api';
 import type { AnalysisProviderStatus, Session, SessionPage, SessionStatus } from './types';
@@ -217,13 +218,13 @@ export function CallRecords({ initialSessionId, initialGrade, initialRange, onCl
       </> : !detailError && <div className="panel call-record-empty">未找到此通话。</div>}
     </> : <>
       <section className="panel call-filter-panel" aria-label="通话筛选器">
-        <div className="call-filter-top"><div className="call-date-presets" aria-label="日期快捷筛选">{[['all', '全部时间'], ['1', '今天'], ['7', '近 7 天'], ['30', '近 30 天']].map(([value, label]) => <button key={value} type="button" aria-pressed={filters.range === value} className={filters.range === value ? 'selected' : ''} onClick={() => setRange(value)}>{label}</button>)}</div><label className="call-answered-toggle"><input type="checkbox" checked={filters.answeredOnly} onChange={event => updateFilters({ answeredOnly: event.target.checked })} />仅显示接通</label></div>
+        <div className="call-filter-top"><div className="call-date-presets" aria-label="日期快捷筛选">{[['all', '全部时间'], ['1', '今天'], ['7', '近 7 天'], ['30', '近 30 天']].map(([value, label]) => <button key={value} type="button" aria-pressed={filters.range === value} className={filters.range === value ? 'selected' : ''} onClick={() => setRange(value)}>{label}</button>)}</div><label className="call-answered-toggle"><input type="checkbox" checked={filters.answeredOnly} onChange={event => updateFilters({ answeredOnly: event.target.checked })} /><span className="call-toggle-track" aria-hidden="true" />仅显示接通</label></div>
         <div className="call-filter-fields">
-          <label><span>日期维度</span><select value={filters.dateField} onChange={event => updateFilters({ dateField: event.target.value as DateField })}><option value="createdAt">开始时间</option><option value="answeredAt">接通时间</option><option value="endedAt">结束时间</option></select></label>
-          <label><span>开始日期</span><input type="date" value={filters.from} max={filters.to || undefined} onChange={event => updateFilters({ from: event.target.value, range: 'custom' })} /></label>
-          <label><span>结束日期</span><input type="date" value={filters.to} min={filters.from || undefined} onChange={event => updateFilters({ to: event.target.value, range: 'custom' })} /></label>
-          <label><span>意向等级</span><select value={filters.grade} onChange={event => updateFilters({ grade: event.target.value })}><option value="">全部等级</option>{GRADES.map(grade => <option value={grade} key={grade}>{grade} 级 · {GRADE_LABELS[grade]}</option>)}</select></label>
-          <label className="call-search"><span>搜索客户</span><input value={searchDraft} onChange={event => setSearchDraft(event.target.value)} placeholder="姓名、公司或电话" /></label>
+          <label className="call-filter-dimension"><span>日期维度</span><span className="call-filter-control call-filter-select"><select value={filters.dateField} onChange={event => updateFilters({ dateField: event.target.value as DateField })}><option value="createdAt">开始时间</option><option value="answeredAt">接通时间</option><option value="endedAt">结束时间</option></select><CaretDown size={14} aria-hidden="true" /></span></label>
+          <label className="call-filter-from"><span>开始日期</span><input type="date" value={filters.from} max={filters.to || undefined} onChange={event => updateFilters({ from: event.target.value, range: 'custom' })} /></label>
+          <label className="call-filter-to"><span>结束日期</span><input type="date" value={filters.to} min={filters.from || undefined} onChange={event => updateFilters({ to: event.target.value, range: 'custom' })} /></label>
+          <label className="call-filter-grade"><span>意向等级</span><span className="call-filter-control call-filter-select"><select value={filters.grade} onChange={event => updateFilters({ grade: event.target.value })}><option value="">全部等级</option>{GRADES.map(grade => <option value={grade} key={grade}>{grade} 级 · {GRADE_LABELS[grade]}</option>)}</select><CaretDown size={14} aria-hidden="true" /></span></label>
+          <label className="call-search"><span>搜索客户</span><span className="call-filter-control call-filter-search"><MagnifyingGlass size={17} aria-hidden="true" /><input value={searchDraft} onChange={event => setSearchDraft(event.target.value)} placeholder="姓名、公司或电话" /></span></label>
         </div>
         {invalidRange && <p className="call-filter-error" role="alert">开始日期不能晚于结束日期。</p>}
       </section>

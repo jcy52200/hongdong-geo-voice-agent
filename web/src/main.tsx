@@ -5,6 +5,7 @@ import './styles.css';
 import './call-records.css';
 import './dashboard.css';
 import './organic.css';
+import './call-filters.css';
 import { MotionConfig } from 'motion/react';
 import { IconContext } from '@phosphor-icons/react';
 

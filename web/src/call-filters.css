@@ -1,0 +1,221 @@
+/* The record toolbar shares the canvas tone and keeps native form semantics. */
+.call-filter-panel {
+  padding: 18px 22px 22px;
+  margin-bottom: 14px;
+  border: 1px solid #dfe7ee;
+  border-radius: 24px;
+  background: #eaf0f5;
+  box-shadow: inset 0 1px 0 #ffffffb3;
+}
+
+.call-filter-panel .call-filter-top {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.call-filter-panel .call-date-presets {
+  display: inline-flex;
+  flex-wrap: nowrap;
+  gap: 2px;
+  padding: 3px;
+  max-width: 100%;
+  border-radius: 999px;
+  background: #dfe7ee;
+}
+
+.call-filter-panel .call-date-presets button {
+  min-height: 34px;
+  padding: 7px 14px;
+  font-size: 12px;
+  line-height: 20px;
+  color: #62748b;
+  white-space: nowrap;
+}
+
+.call-filter-panel .call-date-presets button.selected {
+  color: #d4ff33;
+  box-shadow: 0 2px 5px #22252a15;
+}
+
+.call-filter-panel .call-answered-toggle {
+  position: relative;
+  align-self: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 4px;
+  font-size: 12px;
+  color: #576b82;
+  border-radius: 999px;
+}
+
+.call-filter-panel .call-answered-toggle input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.call-toggle-track {
+  display: block;
+  width: 30px;
+  height: 18px;
+  padding: 3px;
+  border-radius: 999px;
+  background: #aebbc9;
+  transition: background 160ms ease;
+}
+
+.call-toggle-track::before {
+  content: '';
+  display: block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: white;
+  box-shadow: 0 1px 3px #22252a26;
+  transition: transform 160ms ease;
+}
+
+.call-answered-toggle input:checked + .call-toggle-track {
+  background: #22252a;
+}
+
+.call-answered-toggle input:checked + .call-toggle-track::before {
+  transform: translateX(12px);
+  background: #d4ff33;
+}
+
+.call-answered-toggle:has(input:focus-visible) {
+  outline: 2px solid #718345;
+  outline-offset: 3px;
+}
+
+.call-filter-panel .call-filter-fields {
+  grid-template-columns: minmax(120px, .8fr) minmax(150px, 1fr) minmax(150px, 1fr) minmax(172px, 1fr) minmax(190px, 1.4fr);
+  grid-template-areas: 'dimension from to grade search';
+  gap: 12px;
+  align-items: end;
+}
+
+.call-filter-panel .call-filter-fields > label {
+  min-width: 0;
+  gap: 7px;
+  font-size: 11px;
+  line-height: 16px;
+  color: #62748b;
+}
+
+.call-filter-fields > label > span:first-child {
+  padding-left: 12px;
+}
+
+.call-filter-panel .call-filter-fields > .call-filter-dimension { grid-area: dimension; }
+.call-filter-panel .call-filter-from { grid-area: from; }
+.call-filter-panel .call-filter-to { grid-area: to; }
+.call-filter-panel .call-filter-grade { grid-area: grade; }
+.call-filter-panel .call-search { grid-area: search; }
+
+.call-filter-control {
+  position: relative;
+  display: block;
+  min-width: 0;
+}
+
+.call-filter-panel .call-filter-fields input,
+.call-filter-panel .call-filter-fields select {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: 42px;
+  min-height: 42px;
+  margin: 0;
+  padding: 0 14px;
+  border: 1px solid #d7e0e9;
+  border-radius: 999px;
+  background: #f8fafc;
+  color: #3f526a;
+  font: inherit;
+  font-size: 12px;
+  line-height: normal;
+  transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
+}
+
+/* Reset platform select chrome so macOS uses the same pill as other inputs. */
+.call-filter-panel .call-filter-fields select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 34px;
+  cursor: pointer;
+  text-overflow: ellipsis;
+}
+
+.call-filter-control > svg {
+  position: absolute;
+  top: 50%;
+  right: 13px;
+  transform: translateY(-50%);
+  color: #71839a;
+  pointer-events: none;
+}
+
+.call-filter-search > svg {
+  left: 13px;
+  right: auto;
+}
+
+.call-filter-panel .call-filter-search input { padding-left: 38px; }
+.call-filter-panel .call-filter-fields input::placeholder { color: #8594a6; }
+.call-filter-panel .call-filter-fields input:hover,
+.call-filter-panel .call-filter-fields select:hover { border-color: #afbece; }
+
+.call-filter-panel .call-filter-fields input:focus,
+.call-filter-panel .call-filter-fields select:focus {
+  outline: none;
+  border-color: #7f9464;
+  background: #fff;
+  box-shadow: 0 0 0 3px #9bb16c26;
+}
+
+@media (max-width: 1100px) {
+  .call-filter-panel .call-filter-fields {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas: 'dimension from to' 'grade search search';
+  }
+}
+
+@media (max-width: 640px) {
+  .call-filter-panel {
+    padding: 14px 14px 18px;
+    border-radius: 24px;
+  }
+  .call-filter-panel .call-filter-top { gap: 9px; margin-bottom: 14px; }
+  .call-filter-panel .call-date-presets { width: 100%; }
+  .call-filter-panel .call-date-presets button {
+    flex: 1;
+    min-height: 36px;
+    padding: 7px 8px;
+    font-size: 11px;
+  }
+  .call-filter-panel .call-answered-toggle { margin-left: auto; min-height: 32px; }
+  .call-filter-panel .call-filter-fields {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas: 'dimension grade' 'from to' 'search search';
+    gap: 12px 10px;
+  }
+  .call-filter-panel .call-filter-fields input,
+  .call-filter-panel .call-filter-fields select { height: 44px; min-height: 44px; font-size: 12px; }
+  .call-filter-panel .call-filter-fields input[type='date'] { padding: 0 10px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .call-filter-panel input,
+  .call-filter-panel select,
+  .call-toggle-track,
+  .call-toggle-track::before { transition: none; }
+}
