@@ -65,7 +65,6 @@ export function CallRecords({ initialSessionId, initialGrade, initialRange, onCl
   const [filters, setFilters] = useState<Filters>(() => ({ ...defaults, grade: initialGrade ?? '', ...(initialRange ? { from: localDate(new Date(initialRange.from)), to: localDate(new Date(Date.parse(initialRange.to) - 1)), range: 'custom' } : {}) }));
   const [page, setPage] = useState<SessionPage>({ items: [], total: 0, page: 1, pageSize: 20 });
   const [provider, setProvider] = useState<AnalysisProviderStatus | null>(null);
-  const [providerError, setProviderError] = useState('');
   const [selectedId, setSelectedId] = useState(initialSessionId ?? '');
   const [detail, setDetail] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
@@ -115,7 +114,7 @@ export function CallRecords({ initialSessionId, initialGrade, initialRange, onCl
 
   useEffect(() => {
     const controller = new AbortController();
-    void get<AnalysisProviderStatus>('/analysis/status', controller.signal).then(result => { if (!controller.signal.aborted) { setProvider(result); setProviderError(''); } }).catch(reason => { if (!controller.signal.aborted) setProviderError(messageOf(reason)); });
+    void get<AnalysisProviderStatus>('/analysis/status', controller.signal).then(result => { if (!controller.signal.aborted) { setProvider(result); } }).catch(() => { /* Keep call details usable if the optional provider status is unavailable. */ });
     return () => controller.abort();
   }, [revision]);
 
@@ -179,11 +178,6 @@ export function CallRecords({ initialSessionId, initialGrade, initialRange, onCl
   const rangeEnd = Math.min(filters.page * filters.pageSize, page.total);
 
   return <div className={`call-records${selectedId ? ' is-detail' : ''}`}>
-    {!selectedId && <div className="call-analysis-status" role="status">
-      <div><span className={`call-provider-dot ${provider?.configured ? 'ready' : ''}`} /><strong>{providerError ? '暂时无法读取评估状态' : provider?.configured ? '通话评估已就绪' : provider ? '等待配置 DeepSeek API Key' : '正在读取评估状态…'}</strong>{provider && <span className="call-provider-model">{provider.model}</span>}</div>
-      <p>{providerError || (provider?.configured ? `待评估 ${provider.pending} · 评估中 ${provider.running} · 失败 ${provider.failed}` : provider ? '在 .env 中配置 DEEPSEEK_API_KEY 后重启服务，待处理任务会继续执行。' : '接通且结束的语音通话会自动加入评估队列。')}</p>
-    </div>}
-
     {selectedId ? <>
       <div className="call-detail-toolbar"><button type="button" className="text-button" onClick={closeDetail}>← 返回通话列表</button><div><a className="button secondary small" href={`/api/sessions/${encodeURIComponent(selectedId)}/export`} download>导出 JSON</a><button type="button" className="button secondary small" onClick={refresh} disabled={detailLoading}>刷新</button></div></div>
       {detailError && <div className="alert error" role="alert"><p>{detailError}</p></div>}

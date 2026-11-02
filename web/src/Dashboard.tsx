@@ -390,14 +390,14 @@ export function Dashboard({
           </div>
           <div className="lead-metrics">
             <button onClick={() => filterGrade("A")}>
-              <span>A 级 · 微信已确认</span>
+              <span className="intent-pill grade-A">A 级<span className="lead-grade-description"> · 微信已确认</span></span>
               <strong>
                 {number.format(data.grades.A)}
                 <ArrowUpRight size={24} />
               </strong>
             </button>
             <button onClick={() => filterGrade("B")}>
-              <span>B 级 · 可能有意向</span>
+              <span className="intent-pill grade-B">B 级<span className="lead-grade-description"> · 可能有意向</span></span>
               <strong>
                 {number.format(data.grades.B)}
                 <ArrowUpRight size={24} />

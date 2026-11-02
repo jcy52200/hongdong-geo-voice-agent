@@ -23,7 +23,12 @@
   font-weight: 400;
 }
 body {
-  background: #f0f4f8;
+  background-color: #f0f4f8;
+  background-image: linear-gradient(180deg, rgb(195, 213, 244), #f0f4f8);
+  background-size: 100% 25vh;
+  background-size: 100% 25svh;
+  background-position: top center;
+  background-repeat: no-repeat;
   font-size: 14px;
   line-height: 1.5;
 }
@@ -1367,33 +1372,36 @@ tbody tr:hover {
   white-space: nowrap;
   line-height: 1.5;
 }
-.grade-A {
-  background: #d4ff33;
-  color: #3c4a15;
+/* One semantic palette for badges, dashboard metrics and distribution charts. */
+.grade-A { --intent-bg: #d4ff33; --intent-text: #293510; }
+.grade-B { --intent-bg: #38bdf8; --intent-text: #082f49; }
+.grade-C { --intent-bg: #b5c4d8; --intent-text: #233348; }
+.grade-D { --intent-bg: #fbbf24; --intent-text: #452a03; }
+.grade-E { --intent-bg: #c4b5fd; --intent-text: #372168; }
+.grade-F { --intent-bg: #5eead4; --intent-text: #073d35; }
+.grade-G { --intent-bg: #fb7185; --intent-text: #4c1024; }
+:is(.grade-A, .grade-B, .grade-C, .grade-D, .grade-E, .grade-F, .grade-G) {
+  background: var(--intent-bg);
+  color: var(--intent-text);
 }
-.grade-B {
-  background: #dce7f1;
-  color: #58718b;
+.lead-metrics > button > .intent-pill {
+  display: inline-flex;
+  gap: 3px;
+  min-height: 0;
+  white-space: nowrap;
+  color: var(--intent-text);
+  font-size: 10px;
+  padding: 4px 9px;
 }
-.grade-C {
-  background: #e8ebef;
-  color: #8995a6;
-}
-.grade-D {
-  background: #f4ead4;
-  color: #9c804d;
-}
-.grade-E {
-  background: #e3e7ef;
-  color: #8390a7;
-}
-.grade-F {
-  background: #dce9ec;
-  color: #688c94;
-}
-.grade-G {
-  background: #f5ddd6;
-  color: #af7063;
+@media (max-width: 640px) {
+  .lead-metrics .lead-grade-description {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
 }
 .call-analysis-label {
   color: #7a97bc;
@@ -2259,31 +2267,6 @@ tbody tr:hover {
     min-height: 570px;
   }
 }
-/* Grade colors remain semantic and readable on both light cards and charcoal lists. */
-.grade-B {
-  background: #dce7f1;
-  color: #48617d;
-}
-.grade-C {
-  background: #e8ebef;
-  color: #5f6e82;
-}
-.grade-D {
-  background: #f4ead4;
-  color: #806332;
-}
-.grade-E {
-  background: #e8e2f0;
-  color: #74607f;
-}
-.grade-F {
-  background: #dce9ec;
-  color: #486b74;
-}
-.grade-G {
-  background: #f5ddd6;
-  color: #974f42;
-}
 .badge.status-completed {
   color: #5c6b7d;
 }
@@ -2300,15 +2283,6 @@ tbody tr:hover {
 .page-sessions:has(.call-records.is-detail) .page-heading {
   min-height: 68px;
 }
-
-/* Saturated semantic grades stay consistent across the list, detail and legend. */
-.call-records .grade-A { --intent-bg: #d4ff33; --intent-text: #293510; }
-.call-records .grade-B { --intent-bg: #38bdf8; --intent-text: #082f49; }
-.call-records .grade-C { --intent-bg: #b5c4d8; --intent-text: #233348; }
-.call-records .grade-D { --intent-bg: #fbbf24; --intent-text: #452a03; }
-.call-records .grade-E { --intent-bg: #c4b5fd; --intent-text: #372168; }
-.call-records .grade-F { --intent-bg: #5eead4; --intent-text: #073d35; }
-.call-records .grade-G { --intent-bg: #fb7185; --intent-text: #4c1024; }
 
 .call-records .call-grade,
 .call-records .call-grade-legend i {
