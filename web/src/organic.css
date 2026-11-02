@@ -2292,3 +2292,42 @@ tbody tr:hover {
   color: #68778b;
 }
 .call-dialogue .panel-heading h2 { color: #d4e0f0; font-size: 14px; }
+
+/* Detail pages start with the customer and conversation, without service metadata. */
+.page-sessions:has(.call-records.is-detail) .page-heading p {
+  display: none;
+}
+.page-sessions:has(.call-records.is-detail) .page-heading {
+  min-height: 68px;
+}
+
+/* Saturated semantic grades stay consistent across the list, detail and legend. */
+.call-records .grade-A { --intent-bg: #d4ff33; --intent-text: #293510; }
+.call-records .grade-B { --intent-bg: #38bdf8; --intent-text: #082f49; }
+.call-records .grade-C { --intent-bg: #b5c4d8; --intent-text: #233348; }
+.call-records .grade-D { --intent-bg: #fbbf24; --intent-text: #452a03; }
+.call-records .grade-E { --intent-bg: #c4b5fd; --intent-text: #372168; }
+.call-records .grade-F { --intent-bg: #5eead4; --intent-text: #073d35; }
+.call-records .grade-G { --intent-bg: #fb7185; --intent-text: #4c1024; }
+
+.call-records .call-grade,
+.call-records .call-grade-legend i {
+  background: var(--intent-bg);
+  color: var(--intent-text);
+  font-weight: 600;
+}
+.call-records .call-grade {
+  padding: 6px 11px;
+  font-size: 11px;
+}
+.call-records .call-grade b {
+  font-size: 13px;
+  font-weight: 750;
+}
+.call-records .call-assessment .call-grade {
+  padding: 7px 12px;
+  font-size: 12px;
+}
+.call-records .call-assessment .call-grade b {
+  font-size: 14px;
+}

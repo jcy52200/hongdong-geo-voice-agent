@@ -178,11 +178,11 @@ export function CallRecords({ initialSessionId, initialGrade, initialRange, onCl
   const rangeStart = page.total ? (filters.page - 1) * filters.pageSize + 1 : 0;
   const rangeEnd = Math.min(filters.page * filters.pageSize, page.total);
 
-  return <div className="call-records">
-    <div className="call-analysis-status" role="status">
+  return <div className={`call-records${selectedId ? ' is-detail' : ''}`}>
+    {!selectedId && <div className="call-analysis-status" role="status">
       <div><span className={`call-provider-dot ${provider?.configured ? 'ready' : ''}`} /><strong>{providerError ? '暂时无法读取评估状态' : provider?.configured ? '通话评估已就绪' : provider ? '等待配置 DeepSeek API Key' : '正在读取评估状态…'}</strong>{provider && <span className="call-provider-model">{provider.model}</span>}</div>
       <p>{providerError || (provider?.configured ? `待评估 ${provider.pending} · 评估中 ${provider.running} · 失败 ${provider.failed}` : provider ? '在 .env 中配置 DEEPSEEK_API_KEY 后重启服务，待处理任务会继续执行。' : '接通且结束的语音通话会自动加入评估队列。')}</p>
-    </div>
+    </div>}
 
     {selectedId ? <>
       <div className="call-detail-toolbar"><button type="button" className="text-button" onClick={closeDetail}>← 返回通话列表</button><div><a className="button secondary small" href={`/api/sessions/${encodeURIComponent(selectedId)}/export`} download>导出 JSON</a><button type="button" className="button secondary small" onClick={refresh} disabled={detailLoading}>刷新</button></div></div>
@@ -214,7 +214,6 @@ export function CallRecords({ initialSessionId, initialGrade, initialRange, onCl
             <section className="panel call-recording"><div className="panel-heading"><h2>原始录音</h2>{currentDetail.recording && <a className="text-button" href={currentDetail.recording.url} download>下载</a>}</div><div className="panel-body">{currentDetail.recording ? <><audio controls preload="metadata" src={currentDetail.recording.url} aria-label="播放本通电话的原始录音" /><p>双向通话录音 · {(currentDetail.recording.bytes / 1024 / 1024).toFixed(2)} MB</p></> : <p>{currentDetail.mode === 'simulation' ? '文字模拟不产生录音。' : ['created', 'connecting', 'opening', 'active'].includes(currentDetail.status) ? '通话结束后，录音会保存在此处。' : '此通话没有可用录音。历史通话无法补录。'}</p>}</div></section>
           </aside>
         </div>
-        <details className="panel call-prompt-snapshot"><summary>限制词快照<span>查看本通电话实际使用的完整限制词</span></summary><pre>{currentDetail.prompt || '此通话没有保存限制词快照。'}</pre></details>
       </> : !detailError && <div className="panel call-record-empty">未找到此通话。</div>}
     </> : <>
       <section className="panel call-filter-panel" aria-label="通话筛选器">
