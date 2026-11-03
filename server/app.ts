@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage } from 'node:http';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { WebSocketServer } from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 import { z } from 'zod';
 import { DEFAULT_CONFIG, Store } from './store.js';
 import { ControlError, SessionManager } from './sessions.js';
@@ -36,8 +36,10 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
   const worker = new AnalysisWorker(store, options.deepseekApiKey ? new DeepSeekClient({ apiKey: options.deepseekApiKey, baseUrl: options.deepseekBaseUrl, model: options.deepseekModel }) : undefined);
   const recordings = new Recordings(options.recordingsPath ?? resolve(options.databasePath === ':memory:' ? 'data' : dirname(options.databasePath), 'recordings'));
   const app = express();
+  let stopping = false;
   app.disable('x-powered-by');
   app.use((req, res, next) => {
+    if (stopping) { res.status(503).json({ error: '服务正在关闭' }); return; }
     if (!localRequest(req)) { res.status(403).json({ error: '本地工作台仅接受本机来源' }); return; }
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -81,6 +83,7 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
   app.get('/api/analysis/status', (_req, res) => res.json(worker.status()));
   app.get('/api/dashboard', (req, res) => {
     const range = z.object({
+      source: z.enum(['all', 'sip', 'browser', 'softphone_bridge']).default('all'),
       from: z.iso.datetime({ offset: true }).transform(value => new Date(value).toISOString()),
       to: z.iso.datetime({ offset: true }).transform(value => new Date(value).toISOString()),
       offsetMinutes: z.coerce.number().int().min(-840).max(840).default(480),
@@ -91,6 +94,7 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
   });
   app.get('/api/sessions', (req, res) => {
     const query = z.object({
+      source: z.enum(['all', 'sip', 'browser', 'softphone_bridge']).default('all'),
       page: z.coerce.number().int().min(1).max(1000000).default(1), pageSize: z.coerce.number().int().min(1).max(100).default(20),
       answeredOnly: z.enum(['true', 'false']).default('true').transform(value => value === 'true'),
       dateField: z.enum(['createdAt', 'answeredAt', 'endedAt']).default('createdAt'),
@@ -132,7 +136,7 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
   app.post('/api/sessions/:id/recording', express.raw({ type: ['audio/webm', 'audio/mp4', 'audio/ogg'], limit: '25mb' }), async (req, res) => {
     const session = store.session(req.params.id);
     if (!session) { res.status(404).json({ error: '通话记录不存在' }); return; }
-    if (session.mode !== 'seed' || !session.answeredAt || !['completed', 'failed'].includes(session.status)) {
+    if (session.transport !== 'browser' || session.mode !== 'seed' || !session.answeredAt || !['completed', 'failed'].includes(session.status)) {
       res.status(409).json({ error: '仅已结束的接通语音通话可以保存录音' }); return;
     }
     if (session.recording) { res.json(session.recording); return; }
@@ -188,20 +192,49 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
   });
   const server = createServer(app);
   const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024, perMessageDeflate: false });
+  const observers = new WebSocketServer({ noServer: true, maxPayload: 1024, perMessageDeflate: false });
   server.on('upgrade', (req, socket, head) => {
+    if (stopping) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n'); socket.destroy(); return;
+    }
     const path = new URL(req.url ?? '/', 'http://localhost').pathname;
-    const match = path.match(/^\/ws\/sessions\/([a-f0-9-]{36})$/);
+    const match = path.match(/^\/ws\/sessions\/([a-f0-9-]{36})(\/observe)?$/);
     if (!localRequest(req) || !match) {
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); socket.destroy(); return;
     }
-    wss.handleUpgrade(req, socket, head, ws => manager.attach(match[1], ws));
+    if (match[2]) {
+      if (!store.session(match[1])) {
+        socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); socket.destroy(); return;
+      }
+      observers.handleUpgrade(req, socket, head, ws => {
+        ws.on('error', () => {});
+        ws.on('message', () => ws.close(1008, '只读观察连接不接受控制或音频'));
+        let unsubscribe = () => {};
+        const stop = () => { unsubscribe(); ws.close(1000); };
+        ws.once('close', () => unsubscribe());
+        unsubscribe = manager.observe(match[1], event => {
+          if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 256 * 1024) { stop(); return; }
+          try { ws.send(JSON.stringify(event)); } catch { stop(); }
+        });
+      });
+    } else wss.handleUpgrade(req, socket, head, ws => manager.attach(match[1], ws));
   });
-  return { app, server, store, manager, worker, close: async () => {
-    manager.shutdown();
-    await worker.close();
+  let closed: Promise<void> | undefined;
+  const close = () => closed ??= (async () => {
+    stopping = true;
+    const results = await Promise.allSettled([manager.shutdown(), worker.close()]);
     for (const socket of wss.clients) socket.terminate();
     wss.close();
-    if (server.listening) await new Promise<void>((done, reject) => server.close(error => error ? reject(error) : done()));
-    store.close();
-  } };
+    for (const socket of observers.clients) socket.terminate();
+    observers.close();
+    let serverError: unknown;
+    try {
+      if (server.listening) await new Promise<void>((done, reject) => server.close(error => error ? reject(error) : done()));
+    } catch (error) { serverError = error; }
+    finally { store.close(); }
+    const errors = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected').map(result => result.reason);
+    if (serverError) errors.push(serverError);
+    if (errors.length) throw new AggregateError(errors, '部分后台资源关闭未确认');
+  })();
+  return { app, server, store, manager, worker, close };
 }

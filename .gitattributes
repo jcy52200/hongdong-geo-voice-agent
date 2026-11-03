@@ -1,0 +1,2 @@
+# Unified diffs require a literal space on blank context lines.
+deploy/siphon/*.patch -whitespace

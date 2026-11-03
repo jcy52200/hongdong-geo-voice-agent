@@ -38,13 +38,15 @@ export function createSeedSession(session: Pick<Session, 'id' | 'prompt' | 'conf
   };
 }
 
-// Transport only. Each call owns one peer; domain state lives in SessionManager.
+// Transport only. Each call owns one peer; domain state lives in VoiceSessionManager.
 export class SeedPeer {
   private socket: WebSocket;
   private closing = false;
   private timer?: ReturnType<typeof setTimeout>;
+  private resolveClosed!: () => void;
+  private readonly closed = new Promise<void>(resolve => { this.resolveClosed = resolve; });
   constructor(session: Session, key: string, onEvent: (event: SeedEvent) => void,
-    onFailure: (message: string) => void, url = SEED_URL, webSearchKey = '') {
+    private onFailure: (message: string) => void, url = SEED_URL, webSearchKey = '') {
     this.socket = new WebSocket(url, {
       headers: { 'X-Api-Key': key }, handshakeTimeout: 15000, maxPayload: 4 * 1024 * 1024,
       perMessageDeflate: false,
@@ -78,19 +80,27 @@ export class SeedPeer {
     });
     this.socket.on('close', code => {
       clearTimeout(this.timer);
+      this.resolveClosed();
       if (!this.closing) onFailure(`SeedDuplex 连接已关闭（${code}），请新建测试`);
     });
   }
   send(event: Record<string, unknown>) {
-    if (this.closing || this.socket.readyState !== WebSocket.OPEN) return;
+    if (this.closing || this.socket.readyState !== WebSocket.OPEN) return false;
     if (this.socket.bufferedAmount > 1024 * 1024) {
+      this.onFailure('SeedDuplex 上行积压，会话已结束');
       this.socket.terminate();
-      return;
+      return false;
     }
-    this.socket.send(JSON.stringify({ event_id: randomUUID(), ...event }));
+    try {
+      this.socket.send(JSON.stringify({ event_id: randomUUID(), ...event }));
+      return true;
+    } catch {
+      this.onFailure('SeedDuplex 无法发送消息，会话已结束');
+      return false;
+    }
   }
   close() {
-    if (this.closing) return;
+    if (this.closing) return this.closed;
     if (this.socket.readyState === WebSocket.OPEN) {
       this.send({ type: 'session.close' });
       this.closing = true;
@@ -100,5 +110,6 @@ export class SeedPeer {
       this.closing = true;
       this.socket.terminate();
     }
+    return this.closed;
   }
 }

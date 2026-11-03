@@ -1,12 +1,13 @@
 import type { Store } from "./store.js";
 import { GRADES } from "../shared/analysis.js";
-import type { DashboardCall, DashboardData } from "../shared/dashboard.js";
+import type { CallSource, DashboardCall, DashboardData } from "../shared/dashboard.js";
 
 type Row = Record<string, any>;
 export interface DashboardRange {
   from: string;
   to: string;
   offsetMinutes: number;
+  source?: CallSource;
 }
 /** Aggregate all matching rows in SQLite; bootstrap's recent-call limit never affects metrics. */
 export function readDashboard(
@@ -14,7 +15,8 @@ export function readDashboard(
   range: DashboardRange,
 ): Omit<DashboardData, "jobs" | "provider"> {
   const { from, to, offsetMinutes } = range;
-  const source = `FROM sessions s LEFT JOIN analysis_jobs a ON a.session_id=s.id WHERE s.mode='seed' AND s.created_at>=? AND s.created_at<?`;
+  const sourceClause = ({ all: '', sip: " AND s.transport='sip'", browser: " AND s.transport='browser'", softphone_bridge: " AND s.transport='softphone_bridge'" } as const)[range.source ?? 'all'];
+  const source = `FROM sessions s LEFT JOIN analysis_jobs a ON a.session_id=s.id WHERE s.mode='seed' AND s.created_at>=? AND s.created_at<?${sourceClause}`;
   const counts = (start: string, end: string) =>
     store.db
       .prepare(
@@ -93,15 +95,19 @@ export function readDashboard(
   const map = (row: Row): DashboardCall => ({
     id: row.id,
     customer: JSON.parse(row.customer),
+    transport: row.transport,
+    telephone: row.telephone ? JSON.parse(row.telephone) : undefined,
     status: row.status,
     createdAt: row.created_at,
     answeredAt: row.answered_at ?? undefined,
+    answerSource: row.answer_source ?? undefined,
+    modelReadyAt: row.model_ready_at ?? undefined,
     endedAt: row.ended_at ?? undefined,
     analysisStatus: row.analysis_status,
     analysis: row.result ? JSON.parse(row.result) : undefined,
     hasRecording: Boolean(row.recording),
   });
-  const select = `SELECT s.id,s.customer,s.status,s.created_at,s.answered_at,s.ended_at,s.analysis_status,s.recording,a.result `;
+  const select = `SELECT s.id,s.customer,s.status,s.transport,s.telephone,s.created_at,s.answered_at,s.answer_source,s.model_ready_at,s.ended_at,s.analysis_status,s.recording,a.result `;
   return {
     range,
     calls: {

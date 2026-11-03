@@ -1,0 +1,55 @@
+# SIPhon v1.15.11 (f1924f396e367196c782e954c7ad9d42234765b9).
+# Start through start-sip.sh; required values fail preflight. No public default listener.
+# Alibaba CCC SIP terminal mode: upstream registrar must come from the seat's
+# own console/support. This is NOT the BYOC-trunk 106.x:8000 interconnect recipe.
+listen:
+  tls:
+    - address: "${SIPHON_SIP_BIND_IP:-127.0.0.1}:${SIPHON_SIP_PORT:-5061}"
+      advertise: "${SIPHON_ADVERTISED_HOST}"
+domain:
+  local: ["${ALIYUN_SIP_DOMAIN}", "${SIPHON_ADVERTISED_HOST}"]
+advertised_address: "${SIPHON_ADVERTISED_HOST}"
+tls:
+  certificate: "${SIPHON_TLS_CERT_FILE}"
+  private_key: "${SIPHON_TLS_KEY_FILE}"
+  verify_server: true
+script:
+  path: "${SIPHON_ROUTE_FILE}"
+registrant:
+  default_interval: 600
+  retry_interval: 30
+  max_retry_interval: 300
+  entries:
+    - aor: "sip:${ALIYUN_SIP_EXTENSION}@${ALIYUN_SIP_DOMAIN}"
+      # Bare sip:hostname:port. v1.15.11 resolver does not strip URI parameters.
+      registrar: "${ALIYUN_SIP_REGISTRAR_URI}"
+      user: "${ALIYUN_SIP_AUTH_USER}"
+      password: "${ALIYUN_SIP_PASSWORD}"
+      transport: tls
+      contact: "sip:${ALIYUN_SIP_EXTENSION}@${SIPHON_ADVERTISED_HOST}:${SIPHON_SIP_PORT:-5061};transport=tls"
+control:
+  listen: "127.0.0.1:9092"
+  apps:
+    - name: hongdong-pilot
+      token: "${SIPHON_CONTROL_TOKEN}"
+      events: [outbound_registration]
+  limits:
+    event_queue_depth: 1024
+    reattach_grace_secs: 5
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "127.0.0.1:8080"
+    timeout_ms: 3000
+    control_secret: "${SIPHON_RTP_CONTROL_SECRET}"
+  profiles:
+    hongdong_voice:
+      offer: &voice
+        ws_sample_rate: 16000
+        ws_barge_in: false
+        ws_vad: false
+      answer: *voice
+admin:
+  listen: "127.0.0.1:8081"
+log:
+  level: info

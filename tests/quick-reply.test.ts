@@ -96,6 +96,7 @@ async function fixture(t: TestContext, enabled = true, quickReplyText?: string) 
   await browser.take((event: any) => event.type === 'state' && event.status === 'opening');
   await provider.take('input_audio_mute.commit'); await provider.take('speech_text_buffer.commit');
   const activate = async () => {
+    provider.send({ type: 'response.output_audio.delta', delta: Buffer.alloc(240, 2).toString('base64') });
     provider.send({ type: 'response.output_audio.done' }); await browser.take('audio_done');
     browser.send({ type: 'playback_done' });
     await browser.take((event: any) => event.type === 'state' && event.status === 'active');

@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { GRADES, type CallAnalysis } from '../shared/analysis.js';
 import type { Customer } from './prompt.js';
 import type { Transcript } from './types.js';
+import type { PlaybackFact } from '../shared/session.js';
 
 export interface AnalysisInput {
   id: string;
@@ -10,6 +11,7 @@ export interface AnalysisInput {
   status: string;
   answeredAt?: string;
   endReason?: string;
+  playbacks?: PlaybackFact[];
 }
 
 export const analysisOutputSchema = z.object({
@@ -48,8 +50,9 @@ const digits = (text: string) => text.replace(/[零〇一幺二两三四五六�
 export const validMobile = (phone: string) => /^1[3-9]\d{9}$/.test(phone);
 
 /** Count completed conversational turns, not ASR fragments or filler sounds. */
-export function conversationFacts(transcripts: Transcript[]) {
-  const final = transcripts.filter((item) => item.final && item.text.trim());
+export function conversationFacts(transcripts: Transcript[], playbacks?: PlaybackFact[]) {
+  const final = transcripts.filter((item) => item.final && item.text.trim() && (item.kind === 'AsrText' || playbacks === undefined
+    || playbacks.some(play => item.responseId === 'opening' ? play.opening : Boolean(item.responseId && play.responseId === item.responseId))));
   let customerTurns = 0;
   let assistantTurns = 0;
   let previousKind: Transcript['kind'] | undefined;
@@ -66,13 +69,16 @@ export function conversationFacts(transcripts: Transcript[]) {
     }
     previousKind = item.kind;
   }
+  // A model may generate its next reply before even one frame reaches the line.
+  // For telephone calls only gateway RTP-egress evidence counts as speech.
+  if (playbacks !== undefined) assistantTurns = new Set(playbacks.map(play => play.responseId ?? play.playbackId)).size;
   return { final, customerTurns, assistantTurns };
 }
 
 /** Enforce factual invariants after model classification; do not trust generated contact data. */
 export function finalizeAnalysis(input: AnalysisInput, raw: AnalysisOutput, model: string, evaluatedAt = new Date().toISOString()): CallAnalysis {
   const parsed = analysisOutputSchema.parse(raw);
-  const { final, customerTurns, assistantTurns } = conversationFacts(input.transcripts);
+  const { final, customerTurns, assistantTurns } = conversationFacts(input.transcripts, input.playbacks);
   const customers = new Map(final.filter((item) => item.kind === 'AsrText').map((item) => [item.id, item]));
   for (const item of parsed.evidence) {
     const transcript = customers.get(item.transcriptId);

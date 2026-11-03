@@ -1,6 +1,6 @@
 // Versioned interfaces for the local workbench and the future SIP gateway.
 export const INTEGRATION_CONTRACTS = {
-  version: '2.2',
+  version: '2.4',
   crm: {
     status: 'json_import_ready', endpoint: 'POST /api/customers/import',
     body: { customers: [{ camp: '客户公司', name: '联系人', phone: '字符串号码', address: '城市/地址', industry: '可选行业' }] },
@@ -8,13 +8,35 @@ export const INTEGRATION_CONTRACTS = {
     enrichment: '缺失行业写入持久化队列；DeepSeek 按公司名补全，含混名称填未知；手工行业优先。GET /api/customers/export 导出补全后的原资料。',
     note: '已有CRM的提取脚本尚未开发；导出后在本地导入。按规范化电话更新客户。',
   },
+  voiceCore: {
+    status: 'implemented', implemented: true,
+    entrypoint: 'VoiceSessionManager.attachMedia(sessionId, MediaPort)；浏览器由 SessionManager.attach 兼容适配',
+    media: { input: 'PCM16LE mono 16000 Hz, 20 ms / 640 bytes', output: 'PCM16LE mono 24000 Hz' },
+    openingLock: '非空有效PCM + 匹配的模型响应结束 + 同一playbackId的媒体排空；不支持排空的端口拒绝接入',
+    browserProtocol: 'audio_done携带playbackId，新客户端回传；旧无token确认仅浏览器适配器兼容',
+    observation: { endpoint: '/ws/sessions/:id/observe', readOnly: true, audio: false, disconnectEndsCall: false },
+    readiness: 'modelReadyAt独立记录模型就绪；browser_session/legacy来源不表示运营商接通',
+    note: '通用核心同时承接浏览器与SIP媒体；真实客户接通与模型就绪独立；控制平面在第三次任务。',
+  },
+  telephonePilot: {
+    status: 'implemented_local_validation', implemented: true, liveAcceptance: 'pending_external_configuration',
+    entrypoint: 'npm run phone:pilot -- --dial --sample 或 --customer UUID；phone:doctor 默认只检查配置',
+    provider: 'Aliyun CCC MakeCall / PollUserStatus / ReleaseCall，精确核对坐席获准主叫',
+    gateway: 'Siphon 1.15.11 + RTP engine 0.19.0 锁定补丁版本；原版不具备所需drain保证',
+    limit: '人工单通，并发1，固定测试手机；未知结果与资源未确认时不重试',
+    answer: '仅关联正确JobId/InstanceId/号码的CCC客户ANSWERED；坐席接听与早期媒体不算客户接通',
+    media: '逐通一次性媒体授权；16k PCM输入、24k→16k有状态低通重采样与20ms有界节拍输出',
+    playback: 'playbacks记录网关playing/played的RTP发出事实，不能证明手机已听到或听完整句',
+    recordings: 'RecordingFinished后归档双方PCM16 WAV；来源与完整性保留；浏览器不得写入电话录音',
+    readiness: '本地协议与UDP媒体回环已验证；ECS部署、阿里终端注册和真实手机验收待配置',
+  },
   dialer: {
     status: 'reserved', implemented: false,
-    futureBoundary: 'FreeSWITCH ESL 调度器 + 每通独立媒体网关；当前无拨号操作端点',
+    futureBoundary: '工程单通入口已实现；第三次任务再实现业务拨号、调度、编排、自动工具与准入；当前无业务拨号操作端点',
     plannedRequest: { callId: 'UUID', customerId: 'UUID', sipRouteId: 'route-id', campaignId: 'optional' },
     plannedEvents: ['call.ringing', 'call.answered', 'media.playback_completed', 'call.hangup'],
     media: { input: 'PCM16LE mono 16000 Hz, 20 ms / 640 bytes', output: 'PCM16LE mono 24000 Hz' },
-    openingLock: '网关必须在真实播放排空后发送 playback_done；收到音频done不等于客户已听完',
+    openingLock: '未来网关必须通过MediaPort返回与playbackId关联的playback_drained；模型audio.done不代表媒体排空',
     isolation: '一通电话一个模型WebSocket、独立缓冲与prompt快照；电话音频直接走网关，不走扬声器',
   },
   analysis: {
@@ -28,7 +50,7 @@ export const INTEGRATION_CONTRACTS = {
       summary: 'string', evidence: [{ transcriptId: 'UUID', quote: '客户原话' }], needsHumanReview: true,
     },
     endpoints: ['GET /api/analysis/status', 'GET /api/sessions', 'POST /api/sessions/:id/analyze', 'GET /api/sessions/:id/recording'],
-    gatewayBoundary: '当前接通表示 SeedDuplex 语音试打初始化成功；接入SIP后必须以真实 call.answered 更新 answeredAt，并提供独立线路录音。',
+    gatewayBoundary: '浏览器接通是试听初始化；SIP接通必须来自CCC客户通道，独立线路WAV与网关实际播放事实可追溯；未接通电话不评估。',
     note: '结果附客户原话证据；A需许可和已确认微信联系方式，B至少两轮有效回应；不以时长评分。无密钥保留pending，失败最多尝试3次后支持手动重试。',
   },
 };

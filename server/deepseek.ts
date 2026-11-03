@@ -110,12 +110,13 @@ export class DeepSeekClient {
   }
 
   async analyzeCall(session: AnalysisInput, signal?: AbortSignal): Promise<CallAnalysis> {
-    const { final, customerTurns, assistantTurns } = conversationFacts(session.transcripts);
+    const { final, customerTurns, assistantTurns } = conversationFacts(session.transcripts, session.playbacks);
     const data = {
       sessionId: session.id,
       companyBackground: { company: '泓动引擎', business: 'GEO 生成引擎优化，面向企业', objective: '意向筛选、微信联系许可及号码确认' },
       customer: { camp: session.customer.camp, industry: session.customer.industry ?? '未知', phone: session.customer.phone },
       call: { status: session.status, answeredAt: session.answeredAt ?? null, endReason: session.endReason ?? null, customerTurns, assistantTurns },
+      playbackEvidence: session.playbacks,
       transcripts: final.map(({ id, kind, text }) => ({ id, kind, text })),
     };
     const output = analysisOutputSchema.safeParse(await this.json(ANALYSIS_SYSTEM_PROMPT, data, 5000, signal));

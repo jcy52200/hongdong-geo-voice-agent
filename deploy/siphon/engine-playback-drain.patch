@@ -1,0 +1,795 @@
+diff --git a/crates/siphon-rtp-engine/src/engine/takeover.rs b/crates/siphon-rtp-engine/src/engine/takeover.rs
+index 72de1c5..5193d3d 100644
+--- a/crates/siphon-rtp-engine/src/engine/takeover.rs
++++ b/crates/siphon-rtp-engine/src/engine/takeover.rs
+@@ -5,7 +5,9 @@ use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction, SourceFilter};
+ use siphon_rtp_dsp::VoiceDetector;
+ use siphon_rtp_media::bridge::protocol::{Direction as WsDirection, MediaFormat};
+ use siphon_rtp_media::bridge::ws::{BridgeControl, BRIDGE_CONTROL_QUEUE};
+-use siphon_rtp_media::bridge::{run_bridge, BridgeEndReason, BridgeSession};
++use siphon_rtp_media::bridge::{
++    run_bridge_verified, BridgeEndReason, BridgeSession, EgressProgress,
++};
+ use siphon_rtp_media::jitter::JitterBuffer;
+ use siphon_rtp_media::leg::MediaLeg;
+ use siphon_rtp_proto::{CmdResult, Event, ProfileFlags, WsBridgeEndReason, WsVadEngine};
+@@ -402,6 +404,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+ 
+         let (rtp_in_tx, rtp_in_rx) = flume::bounded::<bytes::Bytes>(1024);
+         let (rtp_out_tx, rtp_out_rx) = flume::bounded::<bytes::Bytes>(1024);
++        let egress_progress = Arc::new(EgressProgress::default());
+ 
+         // Announce the bridge **before** spawning the task that can report its end. The task starts
+         // running the moment it is spawned, and a WS server that closes on the handshake (or a dial
+@@ -436,8 +439,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+             let from_tag = from_tag.clone();
+             let stream_id = stream_id.clone();
+             let ended = ended.clone();
++            let egress_progress = egress_progress.clone();
+             tokio::spawn(async move {
+-                let bridge = run_bridge(socket, session, rtp_in_rx, rtp_out_tx, control_rx, ptime);
++                let bridge = run_bridge_verified(
++                    socket,
++                    session,
++                    rtp_in_rx,
++                    rtp_out_tx,
++                    control_rx,
++                    ptime,
++                    egress_progress,
++                );
+                 let reason = match bridge.await {
+                     Ok(BridgeEndReason::ServerClosed) => WsBridgeEndReason::ServerClosed,
+                     Ok(BridgeEndReason::ServerStopped) => WsBridgeEndReason::ServerStopped,
+@@ -481,6 +493,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+                 // across a yield point.
+                 let Some(destination) = *drain_egress.borrow() else {
+                     // An ICE leg before its agent selects: nowhere it may send (RFC 8445 §12).
++                    egress_progress.complete(false);
+                     continue;
+                 };
+                 let datagram: &[u8] = match drain_secure.as_ref() {
+@@ -491,13 +504,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+                             // Fail closed: an unkeyed leg (DTLS still handshaking) or a crypto failure
+                             // drops the frame. Sending it in the clear toward a peer that negotiated
+                             // SRTP is both unplayable and a confidentiality break.
++                            egress_progress.complete(false);
+                             continue;
+                         }
+                         &sealed
+                     }
+                 };
+-                if let Err(error) = datapath.send(drain_endpoint, destination, datagram).await {
+-                    tracing::debug!(%error, "ws bridge downlink send failed");
++                match datapath.send(drain_endpoint, destination, datagram).await {
++                    Ok(sent) => egress_progress.complete(sent == datagram.len()),
++                    Err(error) => {
++                        egress_progress.complete(false);
++                        tracing::debug!(%error, "ws bridge downlink send failed");
++                    }
+                 }
+             }
+         });
+diff --git a/crates/siphon-rtp-media/src/bridge/audio.rs b/crates/siphon-rtp-media/src/bridge/audio.rs
+index f1cdb1f..7ad06e7 100644
+--- a/crates/siphon-rtp-media/src/bridge/audio.rs
++++ b/crates/siphon-rtp-media/src/bridge/audio.rs
+@@ -137,6 +137,16 @@ fn frame_samples_for(format: &MediaFormat) -> usize {
+     (rate * ptime / 1000).max(1)
+ }
+ 
++/// A binary playback boundary tracked in the same sample domain as the playout ring.
++struct PlaybackBoundary {
++    play_id: String,
++    interruptible: bool,
++    first_sample: u64,
++    end_sample: Option<u64>,
++    mark_name: String,
++    started: bool,
++}
++
+ /// The PCM-domain core of a WS bridge session. See the module docs for the uplink/downlink contract.
+ pub struct BridgeCore {
+     format: MediaFormat,
+@@ -153,6 +163,10 @@ pub struct BridgeCore {
+     /// whatever arrives, and fixes the second half of the same bug: a frame queue popped once per tick
+     /// also drained at half the rate it filled, so it saturated and drop-oldest threw audio away.
+     playout: VecDeque<i16>,
++    enqueued_samples: u64,
++    drained_samples: u64,
++    rendered_samples: u64,
++    playbacks: VecDeque<PlaybackBoundary>,
+     /// Ring bound in samples, so the buffered span is the same length of audio whatever frame size the
+     /// server sends.
+     playout_cap_samples: usize,
+@@ -244,6 +258,10 @@ impl BridgeCore {
+             call_id: call_id.into(),
+             direction,
+             playout: VecDeque::with_capacity(playout_cap.max(1) * frame_samples),
++            enqueued_samples: 0,
++            drained_samples: 0,
++            rendered_samples: 0,
++            playbacks: VecDeque::new(),
+             playout_cap_samples: playout_cap.max(1) * frame_samples,
+             frame_samples,
+             ws_decode: vec![0i16; frame_samples],
+@@ -505,12 +523,15 @@ impl BridgeCore {
+                 continue;
+             }
+             self.playout.extend(&self.ws_decode[..decoded]);
++            self.enqueued_samples += decoded as u64;
+         }
+         // Drop-oldest backpressure, in the sample domain: late audio is worthless, and bounding by
+         // samples rather than by frames keeps the buffered span honest whatever the server sends.
+         let excess = self.playout.len().saturating_sub(self.playout_cap_samples);
+         if excess > 0 {
+             self.playout.drain(..excess);
++            self.drained_samples += excess as u64;
++            self.cancel_playbacks("playout_overflow");
+         }
+     }
+ 
+@@ -519,7 +540,20 @@ impl BridgeCore {
+     pub fn on_control(&mut self, message: ControlMessage) -> Option<ControlMessage> {
+         match message {
+             ControlMessage::Clear(data) => {
++                if data.stream_id != self.stream_id
++                    || self.playbacks.iter().any(|p| !p.interruptible)
++                {
++                    return Some(self.playback_error(
++                        "clear_rejected",
++                        "stream mismatch or protected playback",
++                    ));
++                }
+                 self.playout.clear();
++                self.drained_samples = self.enqueued_samples;
++                self.rendered_samples = self.enqueued_samples;
++                self.playbacks.clear();
++                self.pending_control
++                    .retain(|m| !matches!(m, ControlMessage::Mark(_)));
+                 // Surface the flush as a mark so the server can resynchronize turn boundaries.
+                 Some(ControlMessage::Mark(MarkData {
+                     stream_id: self.stream_id.clone(),
+@@ -528,6 +562,7 @@ impl BridgeCore {
+                 }))
+             }
+             ControlMessage::Stop(_) => {
++                self.playbacks.clear();
+                 self.stopped = true;
+                 None
+             }
+@@ -540,10 +575,126 @@ impl BridgeCore {
+                     fatal: false,
+                 }))
+             }
++            ControlMessage::PlayStart(data) => {
++                if data.stream_id != self.stream_id
++                    || self.playbacks.iter().any(|p| p.end_sample.is_none())
++                {
++                    return Some(self.playback_error(
++                        "play_start_rejected",
++                        "stream mismatch or binary segment already open",
++                    ));
++                }
++                if self.playbacks.len() >= 64
++                    || self.playbacks.iter().any(|p| p.play_id == data.play_id)
++                {
++                    return Some(self.playback_error(
++                        "play_start_rejected",
++                        "too many boundaries or duplicate playId",
++                    ));
++                }
++                self.playbacks.push_back(PlaybackBoundary {
++                    play_id: data.play_id,
++                    interruptible: data.interruptible,
++                    first_sample: self.enqueued_samples,
++                    end_sample: None,
++                    mark_name: data.mark_name.unwrap_or_else(|| "played".to_string()),
++                    started: false,
++                });
++                None
++            }
++            ControlMessage::PlayStop(data) => {
++                let Some(last) = self.playbacks.back() else {
++                    return Some(
++                        self.playback_error("play_stop_rejected", "no binary segment open"),
++                    );
++                };
++                if data.stream_id != self.stream_id
++                    || last.play_id != data.play_id
++                    || last.end_sample.is_some()
++                {
++                    return Some(self.playback_error(
++                        "play_stop_rejected",
++                        "stream/playId mismatch or already stopped",
++                    ));
++                }
++                if self.enqueued_samples == last.first_sample {
++                    self.playbacks.pop_back();
++                    return Some(
++                        self.playback_error("empty_playback", "no PCM received for segment"),
++                    );
++                }
++                // A closed segment may end mid-ptime. Silence-pad only that closed tail, preserving
++                // the RTP clock and ensuring it cannot wait forever for another segment's samples.
++                let padding = (self.frame_samples - self.playout.len() % self.frame_samples)
++                    % self.frame_samples;
++                self.playout.extend(std::iter::repeat_n(0, padding));
++                self.enqueued_samples += padding as u64;
++                if let Some(last) = self.playbacks.back_mut() {
++                    last.end_sample = Some(self.enqueued_samples);
++                }
++                self.finish_rendered_playbacks();
++                None
++            }
+             _ => None,
+         }
+     }
+ 
++    fn playback_error(&self, code: &str, message: &str) -> ControlMessage {
++        ControlMessage::Error(ErrorData {
++            stream_id: self.stream_id.clone(),
++            code: code.to_string(),
++            message: message.to_string(),
++            fatal: false,
++        })
++    }
++
++    fn cancel_playbacks(&mut self, code: &str) {
++        if !self.playbacks.is_empty() {
++            self.playbacks.clear();
++            self.pending_control
++                .retain(|m| !matches!(m, ControlMessage::Mark(_)));
++            self.pending_control
++                .push(self.playback_error(code, "playback was not fully rendered"));
++        }
++    }
++
++    fn finish_rendered_playbacks(&mut self) {
++        for segment in &mut self.playbacks {
++            if !segment.started && self.rendered_samples > segment.first_sample {
++                segment.started = true;
++                self.pending_control.push(ControlMessage::Mark(MarkData {
++                    stream_id: self.stream_id.clone(),
++                    play_id: Some(segment.play_id.clone()),
++                    name: "playing".to_string(),
++                }));
++            }
++        }
++        while self
++            .playbacks
++            .front()
++            .is_some_and(|p| p.end_sample.is_some_and(|end| end <= self.rendered_samples))
++        {
++            if let Some(segment) = self.playbacks.pop_front() {
++                self.pending_control.push(ControlMessage::Mark(MarkData {
++                    stream_id: self.stream_id.clone(),
++                    play_id: Some(segment.play_id),
++                    name: segment.mark_name,
++                }));
++            }
++        }
++    }
++
++    /// Called only after this tick's downlink was encoded successfully. The async transport still
++    /// waits for the engine's UDP-egress acknowledgement before releasing these marks to the peer.
++    pub fn downlink_encoded(&mut self, success: bool) {
++        if success {
++            self.rendered_samples = self.drained_samples;
++            self.finish_rendered_playbacks();
++        } else {
++            self.cancel_playbacks("playback_encode_failed");
++        }
++    }
++
+     /// Advance one ptime: dequeue one downlink playout frame (retrievable with
+     /// [`BridgeCore::take_downlink_pcm`]) and clean + frame the staged uplink into `uplink_out` as
+     /// little-endian L16. Returns the uplink bytes written, or 0 when no frame was staged.
+@@ -570,6 +721,7 @@ impl BridgeCore {
+         // so the uplink can cancel against it; the caller renders it after this returns. A barge-in
+         // below drops it along with the rest of the queue, so no bot audio plays that tick.
+         let mut downlink_frame = self.drain_downlink_frame();
++        let mut playback_interrupted = false;
+         let mut uplink_bytes = 0;
+ 
+         if let Some(written) = self.uplink_samples.take() {
+@@ -695,8 +847,11 @@ impl BridgeCore {
+             if let Some(speaking) = speaking {
+                 if speaking && !self.speaking {
+                     // Silence → speech: local barge-in (flush queued playout, no round-trip) + notify.
+-                    if self.barge_in {
++                    if self.barge_in && self.playbacks.iter().all(|p| p.interruptible) {
+                         self.playout.clear();
++                        self.drained_samples = self.enqueued_samples;
++                        self.rendered_samples = self.enqueued_samples;
++                        playback_interrupted = true;
+                         // Also drop the frame already drained this tick, so no bot audio plays on
+                         // barge-in. A comfort-idle leg re-fills it with noise rather than going
+                         // silent: the queued bot audio is what barge-in drops, not the egress clock.
+@@ -726,6 +881,9 @@ impl BridgeCore {
+             uplink_bytes = pcm_to_l16_le(pcm, uplink_out);
+         }
+ 
++        if playback_interrupted {
++            self.cancel_playbacks("playback_interrupted");
++        }
+         self.downlink_ready = downlink_frame;
+         uplink_bytes
+     }
+@@ -762,6 +920,7 @@ impl BridgeCore {
+             self.downlink.resize(self.frame_samples, 0);
+             comfort.fill(COMFORT_NOISE_LEVEL_DBOV, &mut self.downlink[available..]);
+         }
++        self.drained_samples += available as u64;
+         true
+     }
+ 
+@@ -1286,4 +1445,53 @@ mod tests {
+             );
+         }
+     }
++    #[test]
++    fn hongdong_opening_rejects_clear_and_survives_local_vad() {
++        let mut core = core().with_vad(1_000_000, 3, true);
++        let msg=ControlMessage::from_json(r#"{"type":"play_start","data":{"streamId":"str_1","playId":"opening","source":"binary","interruptible":false,"markName":"played"}}"#).unwrap();
++        assert!(core.on_control(msg).is_none());
++        core.on_ws_binary(&vec![0u8; 640]);
++        let reply = core.on_control(ControlMessage::Clear(ClearData {
++            stream_id: "str_1".into(),
++            play_id: None,
++            reason: Some("barge_in".into()),
++        }));
++        assert!(matches!(reply,Some(ControlMessage::Error(data)) if data.code=="clear_rejected"));
++        core.on_pcm_uplink(&[4000i16; 160]);
++        core.tick(&mut [0u8; 1024]);
++        assert_eq!(
++            core.playout_depth(),
++            1,
++            "protected segment must not be cleared by local VAD"
++        );
++        assert!(core.take_downlink_pcm().is_some());
++    }
++
++    #[test]
++    fn hongdong_overflow_and_encoder_failure_cancel_all_played_marks() {
++        for overflow in [true, false] {
++            let mut core = core();
++            core.on_control(ControlMessage::from_json(r#"{"type":"play_start","data":{"streamId":"str_1","playId":"reply","source":"binary"}}"#).unwrap());
++            core.on_ws_binary(&vec![0u8; if overflow { 320 * 9 } else { 320 }]);
++            if !overflow {
++                core.on_control(
++                    ControlMessage::from_json(
++                        r#"{"type":"play_stop","data":{"streamId":"str_1","playId":"reply"}}"#,
++                    )
++                    .unwrap(),
++                );
++                core.tick(&mut [0u8; 1024]);
++                core.downlink_encoded(false);
++            }
++            let mut error = false;
++            while let Some(message) = core.next_control() {
++                assert!(!matches!(message, ControlMessage::Mark(_)));
++                error |= matches!(message, ControlMessage::Error(_));
++            }
++            assert!(
++                error,
++                "audio lost before successful playout must be observable"
++            );
++        }
++    }
+ }
+diff --git a/crates/siphon-rtp-media/src/bridge/mod.rs b/crates/siphon-rtp-media/src/bridge/mod.rs
+index 0bea9d3..1bc8924 100644
+--- a/crates/siphon-rtp-media/src/bridge/mod.rs
++++ b/crates/siphon-rtp-media/src/bridge/mod.rs
+@@ -30,7 +30,7 @@ pub use protocol::{
+ pub use session::{BridgeSession, TickResult};
+ pub use tee::{plan_ws_tee, run_ws_tee, TeeChannel, TeeEndReason, WsTeePlan, WsTeeSink};
+ pub use wire_rate::{validate_wire_sample_rate, wire_resampler, WireRateError};
+-pub use ws::{run_bridge, BridgeEndReason, BridgeError};
++pub use ws::{run_bridge, run_bridge_verified, BridgeEndReason, BridgeError, EgressProgress};
+ 
+ /// Encode i16 PCM samples to little-endian L16 bytes (the M1 binary-frame wire order).
+ ///
+diff --git a/crates/siphon-rtp-media/src/bridge/session.rs b/crates/siphon-rtp-media/src/bridge/session.rs
+index d1001e0..8553506 100644
+--- a/crates/siphon-rtp-media/src/bridge/session.rs
++++ b/crates/siphon-rtp-media/src/bridge/session.rs
+@@ -423,8 +423,12 @@ impl BridgeSession {
+             // renders: one a barge-in flushed never gets here.
+             self.recording_taps.write_heard(rendered);
+             match self.leg.encode_rtp(rendered, downlink_rtp_out) {
+-                Ok(len) => result.downlink_bytes = len,
++                Ok(len) => {
++                    result.downlink_bytes = len;
++                    self.core.downlink_encoded(true);
++                }
+                 Err(error) => {
++                    self.core.downlink_encoded(false);
+                     self.downlink_encode_errors += 1;
+                     if self.downlink_encode_errors == 1 {
+                         tracing::error!(
+diff --git a/crates/siphon-rtp-media/src/bridge/ws.rs b/crates/siphon-rtp-media/src/bridge/ws.rs
+index 3f9131c..c717656 100644
+--- a/crates/siphon-rtp-media/src/bridge/ws.rs
++++ b/crates/siphon-rtp-media/src/bridge/ws.rs
+@@ -6,7 +6,36 @@
+ //! over `flume` channels the engine wires to a datapath redirect flow. Generic over the socket IO
+ //! so it tests over an in-memory duplex with no NIC.
+ 
++use std::collections::VecDeque;
++use std::sync::{
++    atomic::{AtomicBool, AtomicU64, Ordering},
++    Arc,
++};
+ use std::time::Duration;
++use tokio::time::Instant;
++
++/// Shared only with the engine's actual UDP/SRTP send loop. A failed send poisons the stream's
++/// playback acknowledgements: dropping a packet must never be reported as having played it.
++#[derive(Default)]
++pub struct EgressProgress {
++    completed: AtomicU64,
++    failed: AtomicBool,
++}
++impl EgressProgress {
++    /// Report one packet after the actual datapath send has finished, including drop/failure paths.
++    pub fn complete(&self, success: bool) {
++        if !success {
++            self.failed.store(true, Ordering::Release);
++        }
++        self.completed.fetch_add(1, Ordering::Release);
++    }
++}
++
++struct PendingPlaybackMark {
++    message: ControlMessage,
++    target_packet: u64,
++    ready_at: Option<Instant>,
++}
+ 
+ use bytes::Bytes;
+ use futures_util::{SinkExt, StreamExt};
+@@ -93,12 +122,53 @@ pub enum BridgeControl {
+ /// The [`BridgeEndReason`] names which end ended it, so the engine can raise a `ws_bridge_ended`
+ /// that distinguishes "the controller detached it" from "the media server went away".
+ pub async fn run_bridge<S>(
++    socket: WebSocketStream<S>,
++    session: BridgeSession,
++    rtp_in: flume::Receiver<Bytes>,
++    rtp_out: flume::Sender<Bytes>,
++    control: flume::Receiver<BridgeControl>,
++    ptime: Duration,
++) -> Result<BridgeEndReason, BridgeError>
++where
++    S: AsyncRead + AsyncWrite + Unpin,
++{
++    run_bridge_impl(socket, session, rtp_in, rtp_out, control, ptime, None).await
++}
++
++/// Playback-verified variant. The caller MUST complete `progress` once per packet, in FIFO order,
++/// after its actual datapath send. Only this variant advertises hongdong-playout-v1.
++pub async fn run_bridge_verified<S>(
++    socket: WebSocketStream<S>,
++    session: BridgeSession,
++    rtp_in: flume::Receiver<Bytes>,
++    rtp_out: flume::Sender<Bytes>,
++    control: flume::Receiver<BridgeControl>,
++    ptime: Duration,
++    progress: Arc<EgressProgress>,
++) -> Result<BridgeEndReason, BridgeError>
++where
++    S: AsyncRead + AsyncWrite + Unpin,
++{
++    run_bridge_impl(
++        socket,
++        session,
++        rtp_in,
++        rtp_out,
++        control,
++        ptime,
++        Some(progress),
++    )
++    .await
++}
++
++async fn run_bridge_impl<S>(
+     socket: WebSocketStream<S>,
+     mut session: BridgeSession,
+     rtp_in: flume::Receiver<Bytes>,
+     rtp_out: flume::Sender<Bytes>,
+     control: flume::Receiver<BridgeControl>,
+     ptime: Duration,
++    progress: Option<Arc<EgressProgress>>,
+ ) -> Result<BridgeEndReason, BridgeError>
+ where
+     S: AsyncRead + AsyncWrite + Unpin,
+@@ -106,8 +176,16 @@ where
+     let (mut sink, mut stream) = socket.split();
+ 
+     // The first text frame announces the leg + audio format (mod_audio_fork handshake order).
+-    sink.send(Message::text(session.start_message().to_json()?))
+-        .await?;
++    let mut start = session.start_message();
++    if progress.is_some() {
++        if let ControlMessage::Start(data) = &mut start {
++            data.metadata = Some(serde_json::json!({
++                "playbackDrainProtocol": "hongdong-playout-v1",
++                "playbackDrainScope": "successful_udp_egress_plus_ptime"
++            }));
++        }
++    }
++    sink.send(Message::text(start.to_json()?)).await?;
+ 
+     let mut ticker = interval(ptime);
+     let mut uplink = vec![0u8; UPLINK_CAP];
+@@ -115,6 +193,8 @@ where
+     // A closed mailbox completes `recv_async` immediately, every time; polled after that it would
+     // spin the task. Once the engine has dropped its sender there is nothing more to hear.
+     let mut control_open = true;
++    let mut queued_packets = 0u64;
++    let mut playback_marks: VecDeque<PendingPlaybackMark> = VecDeque::new();
+ 
+     let reason = loop {
+         if session.is_stopped() {
+@@ -127,6 +207,9 @@ where
+                 Some(Ok(Message::Text(text))) => match ControlMessage::from_json(text.as_str()) {
+                     Ok(control) => {
+                         if let Some(reply) = session.on_control(control) {
++                            if matches!(&reply, ControlMessage::Mark(data) if data.name == "cleared") {
++                                playback_marks.clear();
++                            }
+                             sink.send(Message::text(reply.to_json()?)).await?;
+                         }
+                     }
+@@ -157,17 +240,53 @@ where
+             },
+             _ = ticker.tick() => {
+                 let result = session.tick(&mut uplink, &mut downlink);
+-                // Turn signals (speech_started/stopped) go out first, so the server reacts to a
+-                // barge-in or turn endpoint without waiting behind this tick's audio frame.
++                // Queue RTP before publishing boundaries, then wait for the actual send loop.
++                if result.downlink_bytes > 0 {
++                    if rtp_out.send(Bytes::copy_from_slice(&downlink[..result.downlink_bytes])).is_err() {
++                        break BridgeEndReason::CallEnded;
++                    }
++                    queued_packets += 1;
++                }
+                 while let Some(control) = session.next_control() {
++                    if matches!(&control, ControlMessage::Mark(data) if data.name != "cleared") {
++                        if progress.is_some() {
++                            playback_marks.push_back(PendingPlaybackMark {
++                                message: control, target_packet: queued_packets, ready_at: None,
++                            });
++                        }
++                        // An unverified caller never emits a successful playback acknowledgement.
++                        continue;
++                    }
++                    if matches!(&control, ControlMessage::Error(_)) { playback_marks.clear(); }
+                     sink.send(Message::text(control.to_json()?)).await?;
+                 }
++                if let Some(progress) = &progress {
++                    if progress.failed.load(Ordering::Acquire) {
++                        playback_marks.clear();
++                    } else {
++                        let completed = progress.completed.load(Ordering::Acquire);
++                        let now = Instant::now();
++                        for mark in &mut playback_marks {
++                            if completed >= mark.target_packet && mark.ready_at.is_none() {
++                                // Wait the final packet's audio duration after successful egress.
++                                // This is a sender guarantee, never a claim about handset playout.
++                                let delay = match &mark.message {
++                                    ControlMessage::Mark(data) if data.name == "playing" => Duration::ZERO,
++                                    _ => ptime,
++                                };
++                                mark.ready_at = Some(now + delay);
++                            }
++                        }
++                        while playback_marks.front().is_some_and(|m| m.ready_at.is_some_and(|at| now >= at)) {
++                            if let Some(mark) = playback_marks.pop_front() {
++                                sink.send(Message::text(mark.message.to_json()?)).await?;
++                            }
++                        }
++                    }
++                }
+                 if result.uplink_bytes > 0 {
+                     sink.send(Message::binary(uplink[..result.uplink_bytes].to_vec())).await?;
+                 }
+-                if result.downlink_bytes > 0 && rtp_out.send(Bytes::copy_from_slice(&downlink[..result.downlink_bytes])).is_err() {
+-                    break BridgeEndReason::CallEnded; // call side gone
+-                }
+             },
+         }
+     };
+@@ -574,4 +693,192 @@ mod tests {
+         );
+         bridge.abort();
+     }
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn hongdong_played_waits_for_actual_egress_and_final_ptime() {
++        use crate::bridge::protocol::{PlaySource, PlayStartData, PlayStopData};
++        let (a, b) = tokio::io::duplex(65536);
++        let server = WebSocketStream::from_raw_socket(a, Role::Server, None).await;
++        let mut client = WebSocketStream::from_raw_socket(b, Role::Client, None).await;
++        let (_in_tx, in_rx) = flume::unbounded();
++        let (out_tx, out_rx) = flume::unbounded();
++        let progress = Arc::new(EgressProgress::default());
++        let worker = tokio::spawn(run_bridge_verified(
++            server,
++            session_fixture(),
++            in_rx,
++            out_tx,
++            flume::bounded(1).1,
++            Duration::from_millis(20),
++            progress.clone(),
++        ));
++        let first = client.next().await.unwrap().unwrap();
++        let Message::Text(text) = first else {
++            panic!("start expected")
++        };
++        let ControlMessage::Start(data) = ControlMessage::from_json(&text).unwrap() else {
++            panic!("start expected")
++        };
++        assert_eq!(
++            data.metadata.unwrap()["playbackDrainProtocol"],
++            "hongdong-playout-v1"
++        );
++        let start = ControlMessage::PlayStart(PlayStartData {
++            stream_id: "str_1".into(),
++            play_id: "opening".into(),
++            source: PlaySource::Binary,
++            audio_data_type: None,
++            encoding: None,
++            sample_rate: None,
++            audio_data: None,
++            interruptible: false,
++            mark_name: Some("played".into()),
++        });
++        client
++            .send(Message::text(start.to_json().unwrap()))
++            .await
++            .unwrap();
++        // A 31.25ms tail must be padded and produce two complete 20ms RTP packets.
++        client.send(Message::binary(vec![0u8; 500])).await.unwrap();
++        client
++            .send(Message::text(
++                ControlMessage::PlayStop(PlayStopData {
++                    stream_id: "str_1".into(),
++                    play_id: "opening".into(),
++                })
++                .to_json()
++                .unwrap(),
++            ))
++            .await
++            .unwrap();
++        for _ in 0..2 {
++            let packet = timeout(Duration::from_secs(1), out_rx.recv_async())
++                .await
++                .unwrap()
++                .unwrap();
++            assert_eq!(RtpPacket::parse(&packet).unwrap().payload.len(), 160);
++        }
++        assert!(
++            timeout(Duration::from_millis(50), client.next())
++                .await
++                .is_err(),
++            "queued RTP is not sent RTP"
++        );
++        progress.complete(true);
++        let Message::Text(started) = timeout(Duration::from_millis(150), client.next())
++            .await
++            .unwrap()
++            .unwrap()
++            .unwrap()
++        else {
++            panic!("playing expected")
++        };
++        assert!(
++            matches!(ControlMessage::from_json(&started).unwrap(), ControlMessage::Mark(data)
++            if data.name == "playing" && data.play_id.as_deref() == Some("opening"))
++        );
++        assert!(
++            timeout(Duration::from_millis(35), client.next())
++                .await
++                .is_err(),
++            "first packet cannot release final boundary"
++        );
++        let sent_at = Instant::now();
++        progress.complete(true);
++        let Message::Text(text) = timeout(Duration::from_millis(150), client.next())
++            .await
++            .unwrap()
++            .unwrap()
++            .unwrap()
++        else {
++            panic!("mark expected")
++        };
++        assert!(Instant::now().duration_since(sent_at) >= Duration::from_millis(20));
++        assert!(
++            matches!(ControlMessage::from_json(&text).unwrap(),ControlMessage::Mark(data)
++            if data.name=="played" && data.play_id.as_deref()==Some("opening"))
++        );
++        worker.abort();
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn hongdong_clear_and_failed_send_never_mean_played() {
++        use crate::bridge::protocol::{ClearData, PlaySource, PlayStartData, PlayStopData};
++        for clear in [true, false] {
++            let (a, b) = tokio::io::duplex(65536);
++            let server = WebSocketStream::from_raw_socket(a, Role::Server, None).await;
++            let mut client = WebSocketStream::from_raw_socket(b, Role::Client, None).await;
++            let (_in_tx, in_rx) = flume::unbounded();
++            let (out_tx, out_rx) = flume::unbounded();
++            let progress = Arc::new(EgressProgress::default());
++            let worker = tokio::spawn(run_bridge_verified(
++                server,
++                session_fixture(),
++                in_rx,
++                out_tx,
++                flume::bounded(1).1,
++                Duration::from_millis(20),
++                progress.clone(),
++            ));
++            client.next().await.unwrap().unwrap();
++            let start = ControlMessage::PlayStart(PlayStartData {
++                stream_id: "str_1".into(),
++                play_id: "reply".into(),
++                source: PlaySource::Binary,
++                audio_data_type: None,
++                encoding: None,
++                sample_rate: None,
++                audio_data: None,
++                interruptible: true,
++                mark_name: Some("played".into()),
++            });
++            client
++                .send(Message::text(start.to_json().unwrap()))
++                .await
++                .unwrap();
++            client.send(Message::binary(vec![0u8; 320])).await.unwrap();
++            client
++                .send(Message::text(
++                    ControlMessage::PlayStop(PlayStopData {
++                        stream_id: "str_1".into(),
++                        play_id: "reply".into(),
++                    })
++                    .to_json()
++                    .unwrap(),
++                ))
++                .await
++                .unwrap();
++            timeout(Duration::from_secs(1), out_rx.recv_async())
++                .await
++                .unwrap()
++                .unwrap();
++            if clear {
++                client
++                    .send(Message::text(
++                        ControlMessage::Clear(ClearData {
++                            stream_id: "str_1".into(),
++                            play_id: None,
++                            reason: Some("barge_in".into()),
++                        })
++                        .to_json()
++                        .unwrap(),
++                    ))
++                    .await
++                    .unwrap();
++                let Message::Text(text) = client.next().await.unwrap().unwrap() else {
++                    panic!("cleared expected")
++                };
++                assert!(
++                    matches!(ControlMessage::from_json(&text).unwrap(),ControlMessage::Mark(data) if data.name=="cleared")
++                );
++            }
++            progress.complete(clear);
++            assert!(
++                timeout(Duration::from_millis(100), client.next())
++                    .await
++                    .is_err(),
++                "clear/failure must never acknowledge successful playout"
++            );
++            worker.abort();
++        }
++    }
+ }

@@ -81,3 +81,26 @@ test('废弃页面不能通过旧待连接会话重新启动演示媒体', { tim
   assert.equal(runtime.store.session(call.id)?.answeredAt, undefined);
   assert.equal(runtime.store.session(call.id)?.status, 'failed');
 });
+
+test('浏览器媒体不能接管或改写真实电话，线路录音也不能由浏览器上传', async t => {
+  const runtime = createApp({ databasePath: ':memory:', apiKey: 'local-test-key' });
+  t.after(() => runtime.close());
+  await new Promise<void>(resolve => runtime.server.listen(0, '127.0.0.1', resolve));
+  const address = `127.0.0.1:${(runtime.server.address() as { port: number }).port}`;
+  const saved = runtime.store.importCustomers([customer])[0];
+  const call = runtime.store.createTelephoneSession(saved);
+  const socket = new WebSocket(`ws://${address}/ws/sessions/${call.id}`);
+  const messages: { type: string; message?: string }[] = [];
+  socket.on('message', data => messages.push(JSON.parse(String(data))));
+  const [code] = await once(socket, 'close');
+  assert.equal(code, 1008); assert.match(messages[0].message!, /真实电话/);
+  assert.equal(runtime.store.session(call.id)!.status, 'created');
+  assert.equal(runtime.manager.runtime(call.id).active, false);
+  runtime.store.updateTelephone(call.id, { jobId: 'test-job' });
+  runtime.store.telephoneAnswered(call.id, { jobId: 'test-job', customerChannelId: 'test-channel' });
+  runtime.store.status(call.id, 'completed');
+  const response = await fetch(`http://${address}/api/sessions/${call.id}/recording`, {
+    method: 'POST', headers: { 'content-type': 'audio/webm' }, body: Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 1, 2, 3]),
+  });
+  assert.equal(response.status, 409); assert.equal(runtime.store.session(call.id)!.recording, undefined);
+});

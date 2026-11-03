@@ -59,11 +59,12 @@ npm start
 | 本地音频 | AudioWorklet 连续重采样；上行16k PCM16、20ms；下行24k PCM16 |
 | 首句不可打断 | 先静音模型输入，等服务端音频完成及播放端实际排空确认后解锁 |
 | 文本与生命周期 | SQLite 持久化；增量更新同一行、终态覆盖；断线/重启明确结束 |
-| 第一板块 | JSON 导入可用；CRM 提取脚本、云 SIP、FreeSWITCH 和批量拨号待开发 |
+| 第一次架构重构 | 通用语音核心与浏览器媒体端口分离；独立只读观察；共享类型与历史接通来源迁移 |
+| 第一板块 | JSON 导入、CCC 人工单通与 Siphon 电话适配已实现并本地验证；真实注册/首通待验，CRM 提取与批量调度待第三次任务 |
 | 第三板块 | DeepSeek 行业补全、持久化分析队列、A–G 带证据意向评估、分页筛选与详情 |
-| 通话录音 | 浏览器真实麦克风与实际播放音频混音保存；支持详情回放 |
+| 通话录音 | 浏览器双向混音；Siphon 双声道线路 WAV 完成后归档，支持详情回放与来源区分 |
 
-浏览器在语音测试时会播放声音，便于调试；后续自动外呼将由独立 FreeSWITCH 媒体网关直连语音适配器，不走本机扬声器。当前没有电话挂断工具：真实模型说完告别后，需要点击“结束本次测试”；关闭页面、断线、服务停止及10分钟测试上限也会释放资源。文字模拟可在结束分支自动收束。
+浏览器试听会播放声音，电话链路通过独立网关连接同一语音核心，不走本机扬声器。当前使用锁版本并打补丁的 Siphon，已验证双向 UDP/RTP、首句排空与双声道 WAV；阿里平台终端注册和手机首通尚未验收。工程测试入口只允许人工发起一通固定测试号码，见[电话测试操作说明](docs/telephone-pilot.md)。当前没有自动业务挂机工具；可用工作台“结束本次测试”、CLI 的 Ctrl+C、客户信令挂断或10分钟上限收尾。独立观察连接断开只取消观察。文字模拟可在结束分支自动收束。
 
 新版 API 不再提供旧协议中同名的字面事件。本项目把客户转写映射为 `AsrText`、模型文本映射为 `ChatText`，保存最终文本和供应商关联 ID。音频文件单独存储，数据库保存录音元数据；原始音频帧事件仅留生命周期元数据。部分生成文本若被打断，不等于客户实际听完的文本，应结合录音复核。首句锁和手动静音期间不录入麦克风；历史版本无录音，不能补造。结束后请保持页面打开至录音保存完成。
 
@@ -72,6 +73,11 @@ npm start
 ## 文档与接入
 
 - [总体架构、完整分期与验收标准](docs/plan.md)
+- [Siphon 架构适配评估与重构规划（拆除、修改、复用）](docs/architecture-refactor-plan.md)
+- [三次重构任务、范围与验收（控制平面最后实施）](docs/refactor-tasks.md)
+- [第二次：人工单通测试、ECS 配置与现场验收](docs/telephone-pilot.md)
+- [Siphon 锁版本、排空补丁与真实 UDP 回环验证](docs/siphon-poc.md)
+- [阿里 CCC API 参数、客户腿证据与凭证边界](docs/aliyun-api-notes.md)
 - [完整销售提示词](prompts/sales-agent.md)
 - [销售脚本、FAQ、快速回复与配置迁移](docs/sales-script.md)
 - [工作台统计口径与 UI 设计](docs/ui-dashboard.md)
@@ -80,9 +86,11 @@ npm start
 - [DeepSeek 行业补全、等级、队列、录音与 API](docs/analysis.md)
 - [第一板块接入与已实现分析契约](server/contracts.ts)：`GET /api/integrations/contracts`
 
-主要 API：`GET /api/bootstrap`、`PUT /api/config`、`POST /api/prompt/preview`、`POST /api/customers/import`、`GET /api/customers/export`、`POST /api/customers/enrich`、`GET /api/analysis/status`、`GET /api/sessions`、`POST /api/sessions`、`GET /api/sessions/:id`、`POST /api/sessions/:id/finish`、`POST /api/sessions/:id/analyze`、`GET /api/sessions/:id/recording`、`GET /api/sessions/:id/export`。本地媒体协议为 `/ws/sessions/:id`，一个新建会话只接受一个客户端连接；中断后新建测试，不重放旧音频。
+主要 API：`GET /api/bootstrap`、`PUT /api/config`、`POST /api/prompt/preview`、`POST /api/customers/import`、`GET /api/customers/export`、`POST /api/customers/enrich`、`GET /api/analysis/status`、`GET /api/sessions`、`POST /api/sessions`、`GET /api/sessions/:id`、`POST /api/sessions/:id/finish`、`POST /api/sessions/:id/analyze`、`GET /api/sessions/:id/recording`、`GET /api/sessions/:id/export`。本地媒体协议为 `/ws/sessions/:id`，一个新建会话只接受一个媒体客户端；中断后新建测试，不重放旧音频。独立只读 `/ws/sessions/:id/observe` 接收会话快照、状态与转写，不接收播放音频；断开仅取消观察，任何入站消息仅关闭该观察连接。
 
-代码分层：`server/prompt.ts` 构建提示词；`seed.ts` 处理供应商传输；`sessions.ts` 管理独立会话及开场锁；`store.ts` 保存资料与记录；`jobs.ts` 消费持久化任务；`deepseek.ts` 与 `analysis.ts` 负责模型请求和事实校验；`recordings.ts` 保存录音；`app.ts` 提供 HTTP/WS；`web/` 是 React 工作台。扩展拨号时先把会话媒体与浏览器拆成通用端口，再接 FreeSWITCH，避免将浏览器权限、播放确认和电话线路混在一起。
+代码分层：`server/prompt.ts` 构建提示词；`seed.ts` 处理供应商传输；`voice/session.ts` 提供通用会话核心与开场锁；`media/port.ts` 定义 PCM 和播放完成契约，`media/browser.ts` 转换浏览器协议，`sessions.ts` 保留兼容入口；`shared/session.ts` 共享会话类型；`store.ts` 保存资料与记录并执行版本化历史迁移；`jobs.ts` 消费既有分析/行业任务；`deepseek.ts` 与 `analysis.ts` 负责模型请求和事实校验；`recordings.ts` 保存录音；`app.ts` 提供 HTTP、媒体及只读观察 WS；`web/` 是 React 工作台。
+
+重构分三次，第一次公共语音核心与浏览器适配已完成；第二次电话网关、双向媒体与线路录音已实现并完成本地验证，云端真实首通待验；第三次才实现控制平面的调度、业务编排、自动工具和时段/频控/停止名单准入。Seed 模型就绪单独记录 `modelReadyAt`，真实电话接通使用 CCC 客户通道证据；浏览器试听的兼容接通时间不代表客户 SIP 接听。详见[三次重构任务与验收](docs/refactor-tasks.md)。
 
 ## 验证
 

@@ -167,3 +167,36 @@ test("工作台按本地日期聚合并包含空白日期，接口校验范围�
     400,
   );
 });
+
+test('工作台保留默认统计并按真实电话来源隔离，传递线路元数据且不把模型就绪计为客户接通', t => {
+  const store = new Store(':memory:'); t.after(() => store.close());
+  const browser = store.createSession(customer, 'seed'); store.answered(browser.id); store.status(browser.id, 'completed'); store.completeAnalysis(browser.id, analysis);
+  const phone = store.createTelephoneSession(customer); store.updateTelephone(phone.id, { jobId: 'job-phone', state: 'dialing', recordingStatus: 'recording' });
+  store.markModelReady(phone.id); store.telephoneAnswered(phone.id, { jobId: 'job-phone', customerChannelId: 'customer-phone' });
+  store.updateTelephone(phone.id, { state: 'ended', recordingStatus: 'failed' }); store.status(phone.id, 'completed'); store.completeAnalysis(phone.id, { ...analysis, grade: 'B' });
+  const unanswered = store.createTelephoneSession(customer); store.markModelReady(unanswered.id);
+  store.updateTelephone(unanswered.id, { jobId: 'job-no-answer', state: 'no_answer', recordingStatus: 'failed' }); store.status(unanswered.id, 'failed');
+  // Even a stale/imported analysis cannot turn an unproven telephone answer into a lead.
+  store.db.prepare("INSERT INTO analysis_jobs(id,session_id,status,result,created_at) VALUES(?,?,'completed',?,?)")
+    .run('stale-analysis-fixture', unanswered.id, JSON.stringify(analysis), analysis.evaluatedAt);
+  store.completeAnalysis(unanswered.id, analysis);
+  const legacy = store.createSession(customer, 'seed'); store.answered(legacy.id); store.status(legacy.id, 'completed'); store.completeAnalysis(legacy.id, { ...analysis, grade: 'C' });
+  store.db.prepare("UPDATE sessions SET transport='softphone_bridge' WHERE id=?").run(legacy.id);
+  for (const id of [browser.id, phone.id, unanswered.id, legacy.id]) store.db.prepare('UPDATE sessions SET created_at=? WHERE id=?').run('2026-11-01T12:00:00Z', id);
+  const range = { from: '2026-10-26T16:00:00Z', to: '2026-11-02T16:00:00Z', offsetMinutes: 480 };
+  const all = readDashboard(store, range);
+  assert.equal(all.calls.total, 4); assert.equal(all.calls.answered, 3); assert.equal(all.grades.A, 1);
+  assert.equal(all.recent.find(call => call.id === browser.id)?.transport, 'browser');
+  assert.equal(all.recent.find(call => call.id === legacy.id)?.transport, 'softphone_bridge');
+  const sip = readDashboard(store, { ...range, source: 'sip' });
+  assert.equal(sip.calls.total, 2); assert.equal(sip.calls.answered, 1); assert.equal(sip.calls.analyzed, 1);
+  assert.equal(sip.grades.A, 0); assert.equal(sip.grades.B, 1); assert.deepEqual(sip.leads.map(call => call.id), [phone.id]);
+  assert.ok(sip.recent.every(call => call.transport === 'sip'));
+  assert.equal(sip.recent.find(call => call.id === phone.id)?.telephone?.jobId, 'job-phone');
+  assert.equal(sip.recent.find(call => call.id === phone.id)?.telephone?.recordingStatus, 'failed');
+  assert.equal(sip.recent.find(call => call.id === phone.id)?.answerSource, 'ccc_customer');
+  assert.ok(sip.recent.find(call => call.id === unanswered.id)?.modelReadyAt);
+  assert.equal(sip.recent.find(call => call.id === unanswered.id)?.answeredAt, undefined);
+  assert.equal(readDashboard(store, { ...range, source: 'browser' }).calls.total, 1);
+  assert.equal(readDashboard(store, { ...range, source: 'softphone_bridge' }).calls.total, 1);
+});

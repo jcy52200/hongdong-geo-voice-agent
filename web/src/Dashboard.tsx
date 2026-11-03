@@ -21,7 +21,7 @@ import {
   Sparkle,
 } from "@phosphor-icons/react";
 import { GRADES, GRADE_LABELS, type Grade } from "../../shared/analysis";
-import type { DashboardCall, DashboardData } from "../../shared/dashboard";
+import type { CallSource, DashboardCall, DashboardData } from "../../shared/dashboard";
 import type { Session } from "./types";
 import { messageOf } from "./api";
 
@@ -32,7 +32,7 @@ interface Props {
   refreshKey: number;
   onNavigate: (page: Destination) => void;
   onOpenSession: (id: string) => void;
-  onGrade: (grade: Grade, range: { from: string; to: string }) => void;
+  onGrade: (grade: Grade, range: { from: string; to: string; source?: CallSource }) => void;
 }
 const number = new Intl.NumberFormat("zh-CN");
 const dateText = (value: string) =>
@@ -53,6 +53,17 @@ const statuses: Record<DashboardCall["status"], string> = {
   completed: "已结束",
   failed: "异常结束",
 };
+const sourceLabels: Record<CallSource, string> = { all: '全部来源（含试听）', sip: '真实电话', browser: '浏览器试听', softphone_bridge: '历史演示' };
+const telephoneStates: Record<NonNullable<DashboardCall['telephone']>['state'], string> = { prepared: '待拨号', dialing: '拨号中', ringing: '客户振铃中', answered: '客户已接通', ended: '已挂断', busy: '客户忙线', no_answer: '无人接听', rejected: '客户拒接', cancelled: '已取消', failed: '线路异常', unknown: '线路状态未知' };
+function callSource(call: DashboardCall) { return call.transport === 'sip' ? '真实电话' : call.transport === 'browser' ? '浏览器试听' : call.transport === 'softphone_bridge' ? '历史演示' : '历史来源'; }
+function callStatus(call: DashboardCall) { return call.transport === 'sip' ? call.telephone ? telephoneStates[call.telephone.state] : '线路状态未知' : statuses[call.status]; }
+function recordingText(call: DashboardCall) {
+  if (call.hasRecording) return '线路录音已归档';
+  return call.telephone?.recordingStatus === 'recording' ? '线路录音中' : call.telephone?.recordingStatus === 'pending' ? '线路录音等待归档' : call.telephone?.recordingStatus === 'failed' ? '线路录音归档失败' : '暂无线路录音';
+}
+function SourceSwitch({ source, onChange }: { source: CallSource; onChange: (value: CallSource) => void }) {
+  return <label><select aria-label="工作台通话来源" value={source} onChange={event => onChange(event.target.value as CallSource)}>{(Object.entries(sourceLabels) as Array<[CallSource, string]>).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>;
+}
 function dateRange(days: number) {
   const to = new Date();
   to.setHours(24, 0, 0, 0);
@@ -81,8 +92,8 @@ function GradePill({ call }: { call: DashboardCall }) {
         : ["pending", "running"].includes(call.analysisStatus)
           ? "待评估"
           : call.answeredAt
-            ? statuses[call.status]
-            : "未接通"}
+            ? callStatus(call)
+            : call.transport === 'sip' ? callStatus(call) : "未连接"}
     </span>
   );
 }
@@ -94,6 +105,7 @@ export function Dashboard({
   onGrade,
 }: Props) {
   const [days, setDays] = useState(7);
+  const [source, setSource] = useState<CallSource>('all');
   const [revision, setRevision] = useState(0);
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -105,7 +117,7 @@ export function Dashboard({
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
   const reducedMotion = useReducedMotion();
-  const range = useMemo(() => dateRange(days), [days, revision, refreshKey]);
+  const range = useMemo(() => ({ ...dateRange(days), source }), [days, revision, refreshKey, source]);
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
@@ -181,6 +193,7 @@ export function Dashboard({
     onGrade(grade, {
       from: data?.range.from ?? range.from,
       to: data?.range.to ?? range.to,
+      source: data?.range.source ?? source,
     });
   }
   function changeRange(value: number) {
@@ -190,12 +203,15 @@ export function Dashboard({
       setSelectedId("");
     }
   }
+  function changeSource(value: CallSource) {
+    if (value !== source) { setData(null); setSource(value); setSelectedId(''); }
+  }
   if (!data)
     return (
       <div className="dashboard">
         <div className="dashboard-range-bar">
           <span>把值得跟进的对话，放在眼前。</span>
-          <RangeSwitch days={days} onChange={changeRange} />
+          <div className="form-actions"><SourceSwitch source={source} onChange={changeSource} /><RangeSwitch days={days} onChange={changeRange} /></div>
         </div>
         {error ? (
           <div className="panel dashboard-empty">
@@ -273,7 +289,7 @@ export function Dashboard({
         <div className="dashboard-context">
           <span className="context-pill">
             <span className="semantic-dot" />
-            本地语音试打
+            {sourceLabels[source]}
           </span>
           <p>
             {loading
@@ -281,8 +297,9 @@ export function Dashboard({
               : `${new Date(data.range.from).toLocaleDateString("zh-CN", { month: "long", day: "numeric" })} — ${new Date(Date.parse(data.range.to) - 1).toLocaleDateString("zh-CN", { month: "long", day: "numeric" })}`}
           </p>
         </div>
-        <RangeSwitch days={days} onChange={changeRange} />
+        <div className="form-actions"><SourceSwitch source={source} onChange={changeSource} /><RangeSwitch days={days} onChange={changeRange} /></div>
       </div>
+      <p className="body-muted">{source === 'all' ? '统计包含真实电话、浏览器试听及历史演示，来源可单独筛选。' : source === 'sip' ? '真实电话接通以阿里云客户通道为准，语音模型就绪时间单独记录。' : source === 'browser' ? '当前统计浏览器语音试听的连接记录。' : '当前统计历史演示的 AI 会话记录。'}</p>
       {error && (
         <div className="alert error" role="alert">
           <p>更新失败，当前保留上次读取的数据：{error}</p>
@@ -326,7 +343,7 @@ export function Dashboard({
           <div
             className="daily-chart"
             role="img"
-            aria-label={`所选期间共发起 ${data.calls.total} 通语音测试，连接成功 ${data.calls.answered} 通`}
+            aria-label={`所选期间共发起 ${data.calls.total} 通语音记录，连接成功 ${data.calls.answered} 通`}
           >
             {data.daily.map((day, index) => (
               <div
@@ -680,7 +697,7 @@ export function Dashboard({
                     <p>
                       {tab === "leads"
                         ? "最近 8 条 A / B 级记录"
-                        : "最近 8 通语音测试"}
+                        : "最近 8 通语音记录"}
                     </p>
                   </div>
                   <label className="workspace-search">
@@ -716,9 +733,9 @@ export function Dashboard({
                         </span>
                         <span className="workspace-customer">
                           <strong>{call.customer.name || "未填写姓名"}</strong>
-                          <small>{call.customer.camp}</small>
+                          <small title={`${call.customer.camp} · ${callSource(call)}${call.transport === 'sip' ? ` · ${callStatus(call)}` : ''}`}>{call.customer.camp} · {callSource(call)}</small>
                         </span>
-                        <span className="workspace-call-time">
+                        <span className="workspace-call-time" title={callStatus(call)}>
                           {dateText(call.createdAt)}
                         </span>
                         <GradePill call={call} />
@@ -740,7 +757,7 @@ export function Dashboard({
                           ? "试试其他姓名、公司或电话号码。"
                           : tab === "leads"
                             ? "完成通话评估后，A / B 级客户会出现在这里。"
-                            : "从一通真实的模拟电话开始，验证您的销售话术。"}
+                            : "从一通浏览器试听开始，验证您的销售话术。"}
                       </p>
                       <button
                         className="button primary"
@@ -773,6 +790,7 @@ export function Dashboard({
                         {selected.customer.phone}
                       </span>
                       <span>{selected.customer.industry || "行业待确认"}</span>
+                      <span>{callSource(selected)}{selected.transport === 'sip' && ` · ${callStatus(selected)}`}</span>
                     </div>
                     <div className="workspace-summary">
                       <span>意向摘要</span>
@@ -786,8 +804,9 @@ export function Dashboard({
                               ? data.provider.analysisConfigured
                                 ? "通话结束后，模型会整理客户意向与判断依据。"
                                 : "对话已保存，配置 DeepSeek 密钥后将继续评估。"
-                              : "此通话未连接成功，不计入客户意向评估。"}
+                              : "此通话尚无接通记录，不计入客户意向评估。"}
                       </p>
+                      {selected.transport === 'sip' && <p>{recordingText(selected)}</p>}
                     </div>
                     {selected.analysisStatus === "completed" &&
                       selected.analysis?.grade === "A" && (

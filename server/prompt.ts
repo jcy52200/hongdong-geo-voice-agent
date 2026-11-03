@@ -1,29 +1,6 @@
 import { readFileSync } from 'node:fs';
-import type { ModelOptions } from '../shared/model-config.js';
-
-export interface Customer {
-  id: string;
-  camp: string;
-  name: string;
-  phone: string;
-  address: string;
-  industry?: string;
-  industryStatus?: 'pending' | 'running' | 'completed' | 'failed';
-  industryError?: string;
-}
-
-export interface AgentConfig {
-  agentName: string;
-  voice: string;
-  speed: number;
-  extraInstructions: string;
-  systemPrompt?: string;
-  loudness?: number;
-  opening?: string;
-  modelOptions?: ModelOptions;
-  quickReplyEnabled?: boolean;
-  quickReplyText?: string;
-}
+import type { AgentConfig, Customer } from '../shared/session.js';
+export type { AgentConfig, Customer } from '../shared/session.js';
 
 /** Play this line first; interruption protection is enforced by the transport. */
 export const OPENING = '歪～，哎您好，我们这边儿是豆包的服务商，主要是帮咱们公司做豆包上的推广和精准获客，那这方面您有了解过吗？';

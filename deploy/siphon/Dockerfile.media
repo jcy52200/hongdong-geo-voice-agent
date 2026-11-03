@@ -1,0 +1,21 @@
+# Pinned upstream + repository-owned playback drain patch. No credentials in build args.
+FROM rust:1.91-slim-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends git make pkg-config clang ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN rustup toolchain install 1.99.1 --profile minimal
+ENV RUSTUP_TOOLCHAIN=1.99.1
+WORKDIR /src
+RUN git clone --depth 1 --branch v0.19.0 https://github.com/siphon-project/siphon-rtp.git . \
+    && test "$(git rev-parse HEAD)" = "4aaaa4b51f4f2d024b0e5224560fc7053157dd79"
+COPY engine-playback-drain.patch /tmp/engine-playback-drain.patch
+RUN git apply --check /tmp/engine-playback-drain.patch && git apply /tmp/engine-playback-drain.patch
+RUN cargo test --locked -p siphon-rtp-media bridge:: --lib
+RUN cargo build --locked --release -p siphon-rtp
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/siphon-rtp /usr/local/bin/siphon-rtp
+COPY --from=build /src/LICENSE /usr/share/licenses/siphon-rtp/LICENSE
+ENTRYPOINT ["/usr/local/bin/siphon-rtp"]
+CMD ["--control", "127.0.0.1:8080", "--relay-bind-ip", "127.0.0.1", "--port-min", "20000", "--port-max", "20019"]

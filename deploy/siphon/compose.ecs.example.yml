@@ -1,0 +1,30 @@
+# Linux ECS only: native Node/controller and SIP process share loopback with this engine.
+# Required env values have no public default. RTP security-group rules must name Alibaba CIDRs.
+services:
+  media:
+    build:
+      context: .
+      dockerfile: Dockerfile.media
+    image: hongdong/siphon-rtp:0.19.0-playout-v1
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - --control
+      - 127.0.0.1:8080
+      - --control-secret-file
+      - /run/secrets/rtp-control
+      - --relay-bind-ip
+      - ${ECS_PRIVATE_IP:?ECS_PRIVATE_IP required}
+      - --advertise-ip
+      - ${ECS_PUBLIC_IP:?ECS_PUBLIC_IP required}
+      - --port-min
+      - '30000'
+      - --port-max
+      - '30199'
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    volumes:
+      - ${SIPHON_RTP_CONTROL_SECRET_FILE:?secret file required}:/run/secrets/rtp-control:ro
+      - ${SIPHON_RECORDING_DIR:?recording directory required}:/recordings
+    tmpfs: [/tmp]

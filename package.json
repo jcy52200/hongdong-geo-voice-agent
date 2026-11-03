@@ -12,10 +12,13 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit && vite build",
     "start": "tsx server/index.ts",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "tsx --test tests/*.test.ts",
+    "phone:doctor": "tsx server/phone-pilot.ts doctor",
+    "phone:pilot": "tsx server/phone-pilot.ts call"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
+    "@siphon-project/control": "0.11.0",
     "express": "^5.1.0",
     "motion": "^14.9.0",
     "react": "^19.2.0",

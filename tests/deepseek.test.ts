@@ -149,3 +149,29 @@ test('busy, assistant and abusive customer evidence retain their distinct grades
     assert.equal(result.grade, grade);
   }
 });
+
+test('电话只按实际RTP播放事实计AI发言，未播放的微信问题不能提供确认上下文', () => {
+  const transcripts = [
+    { ...item('a1', 'ChatText', '老板您好'), responseId: 'opening' },
+    item('u1', 'AsrText', '你说什么'),
+    { ...item('a2', 'ChatText', '我加您微信发行业案例可以吗，现在这个电话就是微信绑定号码对吗？'), responseId: 'unplayed' },
+    item('u2', 'AsrText', '对'),
+  ];
+  const playbacks = [{ playbackId: 'played-opening', responseId: 'greeting', opening: true,
+    startedAt: '2026-11-01T00:00:00Z', scope: 'gateway_rtp_egress' as const }];
+  const session = { ...call(transcripts), playbacks };
+  const facts = conversationFacts(transcripts, playbacks);
+  assert.equal(facts.assistantTurns, 1);
+  assert.equal(facts.customerTurns, 1, 'unplayed model text cannot split continuous customer ASR into two rounds');
+  assert.deepEqual(facts.final.map(row => row.id), ['a1', 'u1', 'u2']);
+  const result = finalizeAnalysis(session, output({ grade: 'A', evidence: [{ transcriptId: 'u2', quote: '对' }],
+    wechat: { consent: true, phone: customer.phone, sameAsDialed: true, identifier: null } }), 'test');
+  assert.equal(result.grade, 'C');
+  assert.equal(result.wechat.consent, false);
+  assert.equal(result.assistantTurns, 1);
+  const second = { playbackId: 'second-started', responseId: 'unplayed', opening: false,
+    startedAt: '2026-11-01T00:00:01Z', scope: 'gateway_rtp_egress' as const };
+  assert.equal(conversationFacts(transcripts, [...playbacks, second]).assistantTurns, 2, 'started but interrupted speech still counts');
+  assert.equal(conversationFacts(transcripts, []).assistantTurns, 0, 'generated text alone is no telephone playback evidence');
+  assert.equal(conversationFacts(transcripts).assistantTurns, 2, 'legacy browser interpretation remains compatible');
+});

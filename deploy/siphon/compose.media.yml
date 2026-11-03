@@ -1,0 +1,38 @@
+# Isolated Linux namespace. No published port, no SIP/CCC credentials, no real call.
+services:
+  media:
+    build:
+      context: .
+      dockerfile: Dockerfile.media
+    image: hongdong/siphon-rtp:0.19.0-playout-v1
+    command: ["--control", "127.0.0.1:8080", "--relay-bind-ip", "127.0.0.1", "--port-min", "20000", "--port-max", "20019", "--metrics-addr", "127.0.0.1:8181"]
+    healthcheck:
+      test: [CMD, /usr/local/bin/siphon-rtp, --healthcheck, '127.0.0.1:8181']
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    volumes:
+      - loopback-recordings:/recordings
+    tmpfs: [/tmp]
+  verify:
+    image: node:24-bookworm-slim
+    profiles: [verify]
+    depends_on:
+      media:
+        condition: service_healthy
+    network_mode: service:media
+    working_dir: /project
+    entrypoint: [node, deploy/siphon/verify-media-loopback.mjs]
+    environment:
+      SIPHON_VERIFY_RECORDING_DIR: /recordings
+    volumes:
+      - ../..:/project:ro
+      - loopback-recordings:/recordings
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+volumes:
+  loopback-recordings:

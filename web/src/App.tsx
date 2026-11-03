@@ -65,7 +65,7 @@ export default function App() {
   const [live, setLive] = useState<Session | null>(null);
   const [viewed, setViewed] = useState<Session | null>(null);
   const [recordsGrade, setRecordsGrade] = useState<Grade | undefined>();
-  const [recordsRange, setRecordsRange] = useState<{ from: string; to: string } | undefined>();
+  const [recordsRange, setRecordsRange] = useState<{ from: string; to: string; source?: import('../../shared/dashboard').CallSource } | undefined>();
   const [dashboardRevision, setDashboardRevision] = useState(0);
   const [openingLocked, setOpeningLocked] = useState(true);
   const [muted, setMuted] = useState(false);
@@ -300,7 +300,7 @@ export default function App() {
           case 'audio_done': if (message.opening) {
             const unlock = () => {
               if (run !== generation.current || liveRef.current?.id !== sessionId || wsRef.current !== ws || ws.readyState !== WebSocket.OPEN) return;
-              ws.send(JSON.stringify({ type: 'playback_done' }));
+              ws.send(JSON.stringify({ type: 'playback_done', playbackId: message.playbackId }));
               openingRef.current = false; setOpeningLocked(false);
               audio?.setInputEnabled(!mutedRef.current);
             };

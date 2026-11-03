@@ -15,6 +15,7 @@ export const DEFAULT_CONFIG: AgentConfig = {
 };
 type Row = Record<string, any>;
 export interface SessionQuery {
+  source?: 'all' | 'sip' | 'browser' | 'softphone_bridge';
   page: number; pageSize: number; answeredOnly: boolean;
   dateField: 'createdAt' | 'answeredAt' | 'endedAt'; from?: string; to?: string;
   sortBy: 'createdAt' | 'status' | 'grade'; sortDir: 'asc' | 'desc'; grade?: string; search?: string;
@@ -29,6 +30,7 @@ export class Store {
       PRAGMA journal_mode = WAL;
       PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS customers (id TEXT PRIMARY KEY, phone TEXT UNIQUE NOT NULL, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY, customer TEXT NOT NULL, config TEXT NOT NULL,
@@ -45,6 +47,11 @@ export class Store {
         id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id),
         type TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS playback_facts (
+        session_id TEXT NOT NULL REFERENCES sessions(id), playback_id TEXT NOT NULL,
+        response_id TEXT, opening INTEGER NOT NULL, started_at TEXT NOT NULL, drained_at TEXT,
+        PRIMARY KEY(session_id, playback_id)
+      );
       CREATE TABLE IF NOT EXISTS analysis_jobs (
         id TEXT PRIMARY KEY, session_id TEXT UNIQUE NOT NULL REFERENCES sessions(id),
         status TEXT NOT NULL DEFAULT 'pending', result TEXT, created_at TEXT NOT NULL
@@ -59,18 +66,29 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at);
     `);
     // Additive migrations retain existing customers, calls and configuration.
-    // Keep retired demo provenance readable; new sessions only use browser.
-    this.addColumns('sessions', { answered_at: 'TEXT', end_reason: 'TEXT', recording: 'TEXT', transport: "TEXT NOT NULL DEFAULT 'browser'" });
+    // Keep retired demo provenance readable. Telephone creation has its own explicit entry point.
+    this.addColumns('sessions', {
+      answered_at: 'TEXT', answer_source: 'TEXT', model_ready_at: 'TEXT',
+      end_reason: 'TEXT', recording: 'TEXT', transport: "TEXT NOT NULL DEFAULT 'browser'", telephone: 'TEXT',
+    });
     this.addColumns('analysis_jobs', { error: 'TEXT', attempts: 'INTEGER NOT NULL DEFAULT 0', next_attempt: 'TEXT', updated_at: 'TEXT' });
+    this.migrateLegacySessionReadiness();
     this.upgradeStockPrompt();
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_answered ON sessions(answered_at);
-      UPDATE sessions SET answered_at=(SELECT MIN(created_at) FROM events WHERE session_id=sessions.id AND type='session.created')
-        WHERE mode='seed' AND answered_at IS NULL;
       UPDATE analysis_jobs SET status='not_requested' WHERE session_id IN (SELECT id FROM sessions WHERE answered_at IS NULL);
       UPDATE sessions SET analysis_status='not_requested' WHERE answered_at IS NULL;
       UPDATE analysis_jobs SET status='pending' WHERE status='running';
       UPDATE sessions SET analysis_status='pending' WHERE analysis_status='running';
       UPDATE industry_jobs SET status='pending' WHERE status='running';`);
+    // A restarted process cannot know whether an external CCC/SIP resource is still alive.
+    // Retain correlation IDs, mark it unknown, and never automatically resume or redial it.
+    for (const row of this.db.prepare(`SELECT id,telephone FROM sessions WHERE transport='sip' AND status IN ('created','connecting','opening','active')`).all() as Row[]) {
+      let telephone: Session['telephone'];
+      try { telephone = row.telephone ? JSON.parse(row.telephone) : undefined; } catch { telephone = undefined; }
+      this.db.prepare(`UPDATE sessions SET status='failed',error='服务重启，电话资源状态未知；请先在平台核实',ended_at=?,end_reason='service_restart',telephone=? WHERE id=?`)
+        .run(new Date().toISOString(), JSON.stringify({ ...telephone, provider: 'aliyun_ccc', gateway: 'siphon', state: 'unknown', endedReason: 'service_restart',
+          recordingStatus: telephone?.recordingStatus === 'recording' ? 'failed' : telephone?.recordingStatus }), row.id);
+    }
     this.db.prepare(`UPDATE sessions SET status='failed', error='服务重启，会话已结束；请新建测试', ended_at=?,end_reason='service_restart'
       WHERE status IN ('connecting','opening','active')`).run(new Date().toISOString());
     for (const row of this.db.prepare(`SELECT id FROM sessions WHERE answered_at IS NOT NULL AND status IN ('completed','failed')
@@ -80,6 +98,26 @@ export class Store {
   private addColumns(table: string, columns: Record<string, string>) {
     const existing = new Set((this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).map(row => row.name));
     for (const [name, type] of Object.entries(columns)) if (!existing.has(name)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
+  }
+  private migrateLegacySessionReadiness() {
+    const id = '2026-11-03-session-readiness-provenance';
+    if (this.db.prepare('SELECT id FROM schema_migrations WHERE id=?').get(id)) return;
+    this.db.exec('BEGIN');
+    try {
+      // Releases before this migration used session.created as the connection
+      // proxy for browser / retired softphone demos. Recover only those rows,
+      // once. A future telephone transport must supply its own answer event.
+      this.db.exec(`UPDATE sessions SET
+        model_ready_at=COALESCE(model_ready_at,(SELECT MIN(created_at) FROM events WHERE session_id=sessions.id AND type='session.created')),
+        answered_at=COALESCE(answered_at,(SELECT MIN(created_at) FROM events WHERE session_id=sessions.id AND type='session.created'))
+        WHERE mode='seed' AND transport IN ('browser','softphone_bridge');
+        UPDATE sessions SET answer_source=CASE transport
+          WHEN 'browser' THEN 'legacy_browser_session' ELSE 'legacy_softphone_bridge' END
+        WHERE mode='seed' AND transport IN ('browser','softphone_bridge')
+          AND answered_at IS NOT NULL AND answer_source IS NULL;`);
+      this.db.prepare('INSERT INTO schema_migrations(id,applied_at) VALUES (?,?)').run(id, new Date().toISOString());
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   close() { this.db.close(); }
   private upgradeStockPrompt() {
@@ -169,22 +207,33 @@ export class Store {
       .run(retryAt ? 'pending' : 'failed', error, retryAt ?? null, new Date().toISOString(), job.customerId, job.camp);
   }
   createSession(customer: Customer, mode: Session['mode']): Session {
+    return this.insertSession(customer, mode, 'browser');
+  }
+  createTelephoneSession(customer: Customer): Session {
+    return this.insertSession(customer, 'seed', 'sip');
+  }
+  private insertSession(customer: Customer, mode: Session['mode'], transport: 'browser' | 'sip'): Session {
     const config = this.config();
     const prompt = buildPrompt(customer, config);
     const id = randomUUID();
-    this.db.prepare(`INSERT INTO sessions(id,customer,config,mode,status,prompt,prompt_hash,created_at,analysis_status)
-      VALUES (?,?,?,?,?,?,?,?,?)`).run(id, JSON.stringify(customer), JSON.stringify(config), mode, 'created', prompt,
-        createHash('sha256').update(prompt).digest('hex'), new Date().toISOString(), 'not_requested');
+    this.db.prepare(`INSERT INTO sessions(id,customer,config,mode,status,prompt,prompt_hash,created_at,analysis_status,transport,telephone)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(id, JSON.stringify(customer), JSON.stringify(config), mode, 'created', prompt,
+        createHash('sha256').update(prompt).digest('hex'), new Date().toISOString(), 'not_requested', transport,
+        transport === 'sip' ? JSON.stringify({ provider: 'aliyun_ccc', gateway: 'siphon', state: 'prepared', recordingStatus: 'pending' }) : null);
     return this.session(id)!;
   }
   private sessionRow(row: Row, full = true): Session {
     return {
       id: row.id, customer: JSON.parse(row.customer), configSnapshot: full ? JSON.parse(row.config) : undefined,
       mode: row.mode, transport: row.transport ?? 'browser', status: row.status, prompt: full ? row.prompt : '', promptHash: row.prompt_hash, createdAt: row.created_at,
-      endedAt: row.ended_at ?? undefined, answeredAt: row.answered_at ?? undefined, endReason: row.end_reason ?? undefined,
+      telephone: row.telephone ? JSON.parse(row.telephone) : undefined,
+      endedAt: row.ended_at ?? undefined, answeredAt: row.answered_at ?? undefined,
+      answerSource: row.answer_source ?? undefined, modelReadyAt: row.model_ready_at ?? undefined,
+      endReason: row.end_reason ?? undefined,
       error: row.error ?? undefined, analysisStatus: row.analysis_status, analysis: row.result ? JSON.parse(row.result) : undefined,
       analysisError: row.analysis_error ?? undefined, recording: row.recording ? JSON.parse(row.recording) : undefined,
       transcripts: full ? this.transcripts(row.id) : [],
+      playbacks: row.transport === 'sip' ? (full ? this.playbacks(row.id) : []) : undefined,
     } as Session;
   }
   session(id: string): Session | undefined {
@@ -197,6 +246,7 @@ export class Store {
   sessionCount(): number { return Number((this.db.prepare('SELECT COUNT(*) AS count FROM sessions').get() as Row).count); }
   listSessions(query: SessionQuery) {
     const clauses: string[] = []; const values: (string | number)[] = [];
+    if (query.source && query.source !== 'all') { clauses.push('s.transport=?'); values.push(query.source); }
     if (query.answeredOnly) clauses.push('s.answered_at IS NOT NULL');
     const dateField = ({ createdAt: 's.created_at', answeredAt: 's.answered_at', endedAt: 's.ended_at' })[query.dateField];
     if (query.from) { clauses.push(`${dateField}>=?`); values.push(query.from); }
@@ -217,7 +267,55 @@ export class Store {
     return { items: rows.map(row => this.sessionRow(row, false)), total, page, pageSize: query.pageSize };
   }
   answered(id: string) {
-    this.db.prepare(`UPDATE sessions SET answered_at=COALESCE(answered_at,?) WHERE id=? AND mode='seed'`).run(new Date().toISOString(), id);
+    // Compatibility for browser tests only. Model readiness on other transports
+    // must never count as the remote customer answering a telephone call.
+    this.db.prepare(`UPDATE sessions SET answered_at=COALESCE(answered_at,?),answer_source=COALESCE(answer_source,'browser_session')
+      WHERE id=? AND mode='seed' AND transport='browser'`).run(new Date().toISOString(), id);
+  }
+  updateTelephone(id: string, patch: Partial<NonNullable<Session['telephone']>>): Session | undefined {
+    const session = this.session(id);
+    if (!session || session.transport !== 'sip' || !session.telephone) return undefined;
+    const old = session.telephone;
+    if ((patch.provider !== undefined && patch.provider !== 'aliyun_ccc') || (patch.gateway !== undefined && patch.gateway !== 'siphon')) return undefined;
+    const states = ['prepared', 'dialing', 'ringing', 'answered', 'ended', 'busy', 'no_answer', 'rejected', 'cancelled', 'failed', 'unknown'] as const;
+    if (patch.state !== undefined && !states.includes(patch.state)) return undefined;
+    if (patch.recordingStatus !== undefined && !['pending', 'recording', 'ready', 'failed'].includes(patch.recordingStatus)) return undefined;
+    if (patch.cleanupStatus !== undefined && !['pending', 'confirmed', 'unknown'].includes(patch.cleanupStatus)) return undefined;
+    for (const key of ['jobId', 'channelId', 'sipCallId', 'customerChannelId', 'endedReason'] as const) {
+      if (patch[key] !== undefined && (typeof patch[key] !== 'string' || !patch[key]?.trim() || patch[key]!.length > 1024 || /[\r\n\0]/.test(patch[key]!))) return undefined;
+      if (key !== 'endedReason' && old[key] && patch[key] !== undefined && patch[key] !== old[key]) return undefined;
+    }
+    const terminal = states.slice(4).includes(old.state as typeof states[4]);
+    const rank = (state: typeof old.state) => states.indexOf(state) < 4 ? states.indexOf(state) : 4;
+    const allowed = new Set(['state', 'jobId', 'channelId', 'sipCallId', 'customerChannelId', 'endedReason', 'recordingStatus', 'cleanupStatus']);
+    const defined = Object.fromEntries(Object.entries(patch).filter(([key, value]) => allowed.has(key) && value !== undefined));
+    const proposed = { ...old, ...defined, provider: 'aliyun_ccc' as const, gateway: 'siphon' as const };
+    if (terminal || (['completed', 'failed'].includes(session.status) && rank(proposed.state) < 4)
+      || (patch.state !== undefined && rank(patch.state) < rank(old.state))) proposed.state = old.state;
+    // Only telephoneAnswered can establish the answered state and its evidence together.
+    if (proposed.state === 'answered' && !session.answeredAt) proposed.state = old.state;
+    if (old.recordingStatus === 'ready') proposed.recordingStatus = 'ready';
+    this.db.prepare('UPDATE sessions SET telephone=? WHERE id=?').run(JSON.stringify(proposed), id);
+    return this.session(id);
+  }
+  telephoneAnswered(id: string, evidence: { jobId: string; customerChannelId: string; at?: string }): Session | undefined {
+    const session = this.session(id);
+    if (!session || session.mode !== 'seed' || session.transport !== 'sip' || !session.telephone
+      || !session.telephone.jobId || session.telephone.jobId !== evidence.jobId || !evidence.customerChannelId?.trim()
+      || evidence.customerChannelId.length > 1024 || /[\r\n\0]/.test(evidence.customerChannelId)
+      || (session.telephone.customerChannelId && session.telephone.customerChannelId !== evidence.customerChannelId)) return undefined;
+    if (session.answeredAt) return session;
+    if (['completed', 'failed'].includes(session.status) || !['prepared', 'dialing', 'ringing', 'answered'].includes(session.telephone.state)) return undefined;
+    const time = evidence.at === undefined ? Date.now() : Date.parse(evidence.at);
+    if (!Number.isFinite(time) || time < Date.parse(session.createdAt) - 5000 || time > Date.now() + 60_000) return undefined;
+    const telephone = { ...session.telephone, state: 'answered' as const, customerChannelId: evidence.customerChannelId };
+    this.db.prepare(`UPDATE sessions SET answered_at=?,answer_source='ccc_customer',telephone=? WHERE id=? AND answered_at IS NULL AND transport='sip'`)
+      .run(new Date(time).toISOString(), JSON.stringify(telephone), id);
+    return this.session(id);
+  }
+  markModelReady(id: string) {
+    this.db.prepare(`UPDATE sessions SET model_ready_at=COALESCE(model_ready_at,?) WHERE id=? AND mode='seed'`)
+      .run(new Date().toISOString(), id);
   }
   status(id: string, status: SessionStatus, error?: string, endReason?: string) {
     const ended = status === 'completed' || status === 'failed';
@@ -272,7 +370,8 @@ export class Store {
   }
   transcripts(id: string): Transcript[] {
     return (this.db.prepare('SELECT * FROM transcripts WHERE session_id=? ORDER BY rowid').all(id) as Row[]).map(r => ({
-      id: r.id, eventId: r.event_id ?? undefined, kind: r.kind, text: r.text, final: Boolean(r.final), createdAt: r.created_at,
+      id: r.id, responseId: r.kind === 'ChatText' ? r.provider_key : undefined,
+      eventId: r.event_id ?? undefined, kind: r.kind, text: r.text, final: Boolean(r.final), createdAt: r.created_at,
     }));
   }
   transcript(id: string, key: string, kind: Transcript['kind'], text: string, final: boolean, eventId?: string, replaceFinal = false): Transcript {
@@ -280,12 +379,25 @@ export class Store {
     // Authoritative provider text may replace the known audio-only quick-reply
     // fallback. Ordinary late deltas must never overwrite a final transcript.
     if (row?.final && !replaceFinal) return this.transcripts(id).find(t => t.id === row.id)!;
-    const transcript = { id: row?.id ?? randomUUID(), eventId, kind, text, final, createdAt: row?.created_at ?? new Date().toISOString() };
+    const transcript = { id: row?.id ?? randomUUID(), responseId: kind === 'ChatText' ? key : undefined, eventId, kind, text, final, createdAt: row?.created_at ?? new Date().toISOString() };
     this.db.prepare(`INSERT INTO transcripts(id,session_id,provider_key,event_id,kind,text,final,created_at)
       VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(session_id,provider_key,kind)
       DO UPDATE SET text=excluded.text,final=excluded.final,event_id=excluded.event_id`).run(
         transcript.id, id, key, eventId ?? null, kind, text, final ? 1 : 0, transcript.createdAt);
     return transcript;
+  }
+  playbacks(id: string): NonNullable<Session['playbacks']> {
+    return (this.db.prepare('SELECT * FROM playback_facts WHERE session_id=? ORDER BY started_at,rowid').all(id) as Row[]).map(row => ({
+      playbackId: row.playback_id, responseId: row.response_id ?? undefined, opening: Boolean(row.opening),
+      startedAt: row.started_at, drainedAt: row.drained_at ?? undefined, scope: 'gateway_rtp_egress',
+    }));
+  }
+  playback(id: string, segment: { id: string; responseId?: string; opening: boolean }, phase: 'started' | 'drained') {
+    if (this.db.prepare('SELECT transport FROM sessions WHERE id=?').get(id)?.transport !== 'sip') return;
+    const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO playback_facts(session_id,playback_id,response_id,opening,started_at,drained_at)
+      VALUES (?,?,?,?,?,?) ON CONFLICT(session_id,playback_id) DO UPDATE SET drained_at=COALESCE(playback_facts.drained_at,excluded.drained_at)`)
+      .run(id, segment.id, segment.responseId ?? null, segment.opening ? 1 : 0, now, phase === 'drained' ? now : null);
   }
   event(id: string, type: string, payload: unknown) {
     this.db.prepare('INSERT INTO events(session_id,type,payload,created_at) VALUES (?,?,?,?)').run(id, type, JSON.stringify(payload), new Date().toISOString());

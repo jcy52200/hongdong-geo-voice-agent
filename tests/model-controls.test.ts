@@ -93,6 +93,7 @@ async function fixture(t: TestContext) {
   });
   const control = (body: unknown) => request(`/sessions/${session.id}/control`, body);
   const activate = async () => {
+    provider.send({ type: 'response.output_audio.delta', delta: Buffer.alloc(240, 2).toString('base64') });
     provider.send({ type: 'response.output_audio.done' }); await browser.take('audio_done');
     browser.send({ type: 'playback_done' });
     await browser.take((event: any) => event.type === 'state' && event.status === 'active');

@@ -1,27 +1,14 @@
-import type { CallAnalysis, Grade } from "./analysis.js";
+import type { Grade } from "./analysis.js";
+import type { Session } from "./session.js";
+export type CallSource = 'all' | 'sip' | 'browser' | 'softphone_bridge';
 
-export interface DashboardCall {
-  id: string;
-  customer: {
-    id: string;
-    camp: string;
-    name: string;
-    phone: string;
-    address: string;
-    industry?: string;
-  };
-  status:
-    "created" | "connecting" | "opening" | "active" | "completed" | "failed";
-  createdAt: string;
-  answeredAt?: string;
-  endedAt?: string;
-  analysisStatus:
-    "not_requested" | "pending" | "running" | "completed" | "failed";
-  analysis?: CallAnalysis;
+export interface DashboardCall extends Pick<Session,
+  "id" | "customer" | "status" | "createdAt" | "answeredAt" | "answerSource" |
+  "modelReadyAt" | "endedAt" | "analysisStatus" | "analysis" | "transport" | "telephone"> {
   hasRecording: boolean;
 }
 export interface DashboardData {
-  range: { from: string; to: string; offsetMinutes: number };
+  range: { from: string; to: string; offsetMinutes: number; source?: CallSource };
   calls: {
     total: number;
     answered: number;

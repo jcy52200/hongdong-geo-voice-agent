@@ -124,6 +124,7 @@ async function activate(call: Call) {
   await call.browser.take(message => message.type === 'state' && message.status === 'opening');
   await call.provider.take('input_audio_mute.commit');
   assert.equal((await call.provider.take('speech_text_buffer.commit')).text, OPENING);
+  call.provider.send({ type: 'response.output_audio.delta', delta: Buffer.alloc(240, 2).toString('base64') });
   call.provider.send({ type: 'response.output_audio.done' });
   await call.browser.take('audio_done');
   call.browser.send({ type: 'playback_done' });
@@ -169,7 +170,9 @@ test('真实 WebSocket 握手、固定首句媒体锁、播放确认及完成关
   assert.deepEqual(app.store.transcripts(call.session.id).map(row => row.text), [OPENING]);
 
   call.provider.send({ type: 'response.output_audio.done', response_id: 'greeting', status_code: '20000002' });
-  assert.deepEqual(await call.browser.take('audio_done'), { type: 'audio_done', opening: true });
+  const audioDone = await call.browser.take('audio_done');
+  assert.equal(audioDone.opening, true);
+  assert.equal(typeof audioDone.playbackId, 'string');
   assert.equal(app.store.session(call.session.id)?.status, 'opening', 'generation done is not playback drained');
   assert.equal(call.provider.history.some(message => message.type === 'input_audio_unmute.commit'), false);
   call.browser.send({ type: 'playback_done' });
