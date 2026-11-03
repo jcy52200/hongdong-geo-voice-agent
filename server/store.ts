@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { buildPrompt, DEFAULT_SYSTEM_PROMPT, OPENING } from './prompt.js';
-import type { AgentConfig, Customer, Session, SessionStatus, SessionTransport, Transcript } from './types.js';
+import type { AgentConfig, Customer, Session, SessionStatus, Transcript } from './types.js';
 import type { CallAnalysis } from '../shared/analysis.js';
 import { INITIAL_INTRODUCTION_TEMPLATE } from './sales-script.js';
 
@@ -59,6 +59,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at);
     `);
     // Additive migrations retain existing customers, calls and configuration.
+    // Keep retired demo provenance readable; new sessions only use browser.
     this.addColumns('sessions', { answered_at: 'TEXT', end_reason: 'TEXT', recording: 'TEXT', transport: "TEXT NOT NULL DEFAULT 'browser'" });
     this.addColumns('analysis_jobs', { error: 'TEXT', attempts: 'INTEGER NOT NULL DEFAULT 0', next_attempt: 'TEXT', updated_at: 'TEXT' });
     this.upgradeStockPrompt();
@@ -167,26 +168,13 @@ export class Store {
     this.db.prepare(`UPDATE industry_jobs SET status=?,error=?,next_attempt=?,updated_at=? WHERE customer_id=? AND camp=? AND status='running'`)
       .run(retryAt ? 'pending' : 'failed', error, retryAt ?? null, new Date().toISOString(), job.customerId, job.camp);
   }
-  createSession(customer: Customer, mode: Session['mode'], options: { transport?: SessionTransport; bridgeConfirmed?: boolean } = {}): Session {
-    const transport = options.transport ?? 'browser';
-    if (!['browser', 'softphone_bridge'].includes(transport)) throw new Error('不支持的音频接入方式');
-    if (transport === 'softphone_bridge' && (mode !== 'seed' || options.bridgeConfirmed !== true)) {
-      throw new Error('软电话桥接仅用于语音测试，且需人工确认电话已接通');
-    }
+  createSession(customer: Customer, mode: Session['mode']): Session {
     const config = this.config();
     const prompt = buildPrompt(customer, config);
     const id = randomUUID();
-    this.db.prepare(`INSERT INTO sessions(id,customer,config,mode,transport,status,prompt,prompt_hash,created_at,analysis_status)
-      VALUES (?,?,?,?,?,?,?,?,?,?)`).run(id, JSON.stringify(customer), JSON.stringify(config), mode, transport, 'created', prompt,
+    this.db.prepare(`INSERT INTO sessions(id,customer,config,mode,status,prompt,prompt_hash,created_at,analysis_status)
+      VALUES (?,?,?,?,?,?,?,?,?)`).run(id, JSON.stringify(customer), JSON.stringify(config), mode, 'created', prompt,
         createHash('sha256').update(prompt).digest('hex'), new Date().toISOString(), 'not_requested');
-    this.event(id, 'local.transport.selected', {
-      transport, sipSignaling: false,
-      answeredAtSource: mode === 'seed' ? 'seed_session_created' : null,
-      ...(transport === 'softphone_bridge' ? {
-        connectionConfirmation: 'manual',
-        note: '软电话演示：操作者人工确认电话已接通；系统未接收SIP接通或挂机事件，answeredAt仅代表AI初始化成功。',
-      } : {}),
-    });
     return this.session(id)!;
   }
   private sessionRow(row: Row, full = true): Session {

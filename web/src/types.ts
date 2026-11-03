@@ -3,6 +3,7 @@ export interface Customer { id: string; camp: string; name: string; phone: strin
 import type { ModelOptions } from '../../shared/model-config';
 export interface AgentConfig { agentName: string; voice: string; speed: number; extraInstructions: string; systemPrompt?: string; loudness?: number; opening?: string; modelOptions?: ModelOptions; quickReplyEnabled?: boolean; quickReplyText?: string }
 export type SessionStatus = 'created' | 'connecting' | 'opening' | 'active' | 'completed' | 'failed';
+/** Retain retired demo provenance when reading history; new sessions use browser. */
 export type SessionTransport = 'browser' | 'softphone_bridge';
 export interface Transcript { id: string; eventId?: string; kind: 'AsrText' | 'ChatText'; text: string; final: boolean; createdAt: string }
 export interface Recording { url: string; mimeType: string; bytes: number; createdAt: string }

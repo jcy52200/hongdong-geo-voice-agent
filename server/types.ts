@@ -2,6 +2,7 @@ import type { AgentConfig, Customer } from './prompt.js';
 import type { AnalysisStatus, CallAnalysis } from '../shared/analysis.js';
 export type { AgentConfig, Customer } from './prompt.js';
 export type SessionStatus = 'created' | 'connecting' | 'opening' | 'active' | 'completed' | 'failed';
+/** softphone_bridge is read-only metadata for records from the retired demo. */
 export type SessionTransport = 'browser' | 'softphone_bridge';
 export interface Transcript {
   id: string;

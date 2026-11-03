@@ -51,6 +51,11 @@ export class SessionManager {
       client.send(JSON.stringify({ type: 'error', message: '该会话不存在或已经连接，请新建测试' }));
       client.close(1008); return;
     }
+    if (session.transport !== 'browser') {
+      this.store.status(id, 'failed', '该演示接入已停用，请新建浏览器测试');
+      client.send(JSON.stringify({ type: 'error', message: '该演示接入已停用，请新建浏览器测试' }));
+      client.close(1008); return;
+    }
     if (session.mode === 'seed' && !this.key) {
       this.store.status(id, 'failed', '未配置 SEED_API_KEY');
       client.send(JSON.stringify({ type: 'error', message: '请在服务端 .env 配置 SEED_API_KEY 后重启' }));
