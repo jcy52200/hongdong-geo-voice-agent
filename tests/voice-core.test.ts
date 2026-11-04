@@ -482,3 +482,26 @@ test('数据库终结写入失败仍关闭模型与媒体，远端事件写入�
   assert.equal(second.media.closes, 1);
   app.store.event = event;
 });
+
+test('真实Seed音频分片可省略response_id，沿用started关联且仍等待首句排空', async t => {
+  const app = await fixture(t); const call = await app.connect(); await app.beginOpening(call);
+  const pcm = Buffer.alloc(960, 4);
+  call.provider.send({ type: 'response.output_audio.started', response_id: 'real-opening', tts_type: 'chat_tts_text' });
+  call.provider.send({ type: 'response.output_audio.delta', delta: pcm.toString('base64'), event_id: 'chunk-1' });
+  call.provider.send({ type: 'response.output_audio.done', response_id: 'wrong-response' });
+  await barrier(call.provider.socket);
+  assert.equal(call.media.audio.length, 1); assert.deepEqual(call.media.audio[0].pcm, pcm);
+  assert.equal(call.media.audio[0].segment.responseId, 'real-opening');
+  assert.equal(call.media.completions.length, 0); assert.equal(app.store.session(call.session.id)?.status, 'opening');
+  call.provider.send({ type: 'response.output_audio.done', response_id: 'real-opening' });
+  await barrier(call.provider.socket);
+  assert.equal(call.media.completions.length, 1);
+  assert.equal(app.store.session(call.session.id)?.status, 'opening');
+  call.media.emit({ type: 'playback_drained', playbackId: call.media.completions[0].id });
+  await call.provider.take('input_audio_unmute.commit');
+  assert.equal(app.store.session(call.session.id)?.status, 'active');
+  call.provider.send({ type: 'response.output_audio.started', response_id: 'next-response' });
+  call.provider.send({ type: 'response.output_audio.delta', delta: pcm.toString('base64') });
+  await barrier(call.provider.socket);
+  assert.equal(call.media.audio[1].segment.responseId, 'next-response');
+});

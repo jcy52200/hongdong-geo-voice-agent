@@ -195,7 +195,12 @@ export class VoiceSessionManager {
     }
     if (event.type === 'response.output_audio.started' || event.type === 'response.output_audio.delta' || event.type === 'response.output_audio.done') {
       const responseId = typeof event.response_id === 'string' && event.response_id ? event.response_id : undefined;
-      if (opening && call.openingPlayback.responseId && responseId !== call.openingPlayback.responseId) return;
+      // Seed labels started/done, but PCM deltas can contain only
+      // type/delta/event_id. Bind those chunks to the protected opening;
+      // an unlabelled done still cannot finish a labelled opening.
+      const unlabelledDelta = event.type === 'response.output_audio.delta' && !responseId;
+      if (opening && call.openingAudioDone && unlabelledDelta) return;
+      if (opening && call.openingPlayback.responseId && responseId !== call.openingPlayback.responseId && !unlabelledDelta) return;
       if (opening) {
         if (responseId) call.openingPlayback.responseId ??= responseId;
         call.playback = call.openingPlayback;
