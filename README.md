@@ -76,6 +76,7 @@ npm start
 - [Siphon 架构适配评估与重构规划（拆除、修改、复用）](docs/architecture-refactor-plan.md)
 - [三次重构任务、范围与验收（控制平面最后实施）](docs/refactor-tasks.md)
 - [第二次：人工单通测试、ECS 配置与现场验收](docs/telephone-pilot.md)
+- [真实电话测试：外接信息、端口协议和最新准备检查](docs/real-call-readiness.md)
 - [Siphon 锁版本、排空补丁与真实 UDP 回环验证](docs/siphon-poc.md)
 - [阿里 CCC API 参数、客户腿证据与凭证边界](docs/aliyun-api-notes.md)
 - [完整销售提示词](prompts/sales-agent.md)
