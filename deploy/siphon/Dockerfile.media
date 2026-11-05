@@ -11,6 +11,7 @@ COPY engine-playback-drain.patch /tmp/engine-playback-drain.patch
 RUN git apply --check /tmp/engine-playback-drain.patch && git apply /tmp/engine-playback-drain.patch
 RUN cargo test --locked -p siphon-rtp-media bridge:: --lib
 RUN cargo build --locked --release -p siphon-rtp
+RUN strip target/release/siphon-rtp
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \

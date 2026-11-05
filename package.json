@@ -14,7 +14,9 @@
     "start": "tsx server/index.ts",
     "test": "tsx --test tests/*.test.ts",
     "phone:doctor": "tsx server/phone-pilot.ts doctor",
-    "phone:pilot": "tsx server/phone-pilot.ts call"
+    "phone:pilot": "tsx server/phone-pilot.ts call",
+    "trunk:doctor": "tsx server/trunk-pilot.ts doctor",
+    "trunk:pilot": "tsx server/trunk-pilot.ts call"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",

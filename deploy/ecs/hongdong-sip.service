@@ -1,0 +1,26 @@
+[Unit]
+Description=Hongdong GEO dedicated SIP endpoint
+After=network-online.target hongdong-media.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hongdong
+Group=hongdong
+WorkingDirectory=/opt/hongdong-geo/current
+EnvironmentFile=/etc/hongdong-geo/voice.env
+ExecStart=/opt/hongdong-geo/runtime/siphon/siphon -c /etc/hongdong-geo/siphon.yaml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hongdong-geo
+MemoryMax=256M
+CPUWeight=50
+
+[Install]
+WantedBy=multi-user.target

@@ -86,7 +86,7 @@ export class Store {
       let telephone: Session['telephone'];
       try { telephone = row.telephone ? JSON.parse(row.telephone) : undefined; } catch { telephone = undefined; }
       this.db.prepare(`UPDATE sessions SET status='failed',error='服务重启，电话资源状态未知；请先在平台核实',ended_at=?,end_reason='service_restart',telephone=? WHERE id=?`)
-        .run(new Date().toISOString(), JSON.stringify({ ...telephone, provider: 'aliyun_ccc', gateway: 'siphon', state: 'unknown', endedReason: 'service_restart',
+        .run(new Date().toISOString(), JSON.stringify({ ...telephone, provider: telephone?.provider === 'aliyun_udp_trunk' ? 'aliyun_udp_trunk' : 'aliyun_ccc', gateway: 'siphon', state: 'unknown', endedReason: 'service_restart',
           recordingStatus: telephone?.recordingStatus === 'recording' ? 'failed' : telephone?.recordingStatus }), row.id);
     }
     this.db.prepare(`UPDATE sessions SET status='failed', error='服务重启，会话已结束；请新建测试', ended_at=?,end_reason='service_restart'
@@ -212,6 +212,11 @@ export class Store {
   createTelephoneSession(customer: Customer): Session {
     return this.insertSession(customer, 'seed', 'sip');
   }
+  createTrunkSession(customer: Customer): Session {
+    const session = this.insertSession(customer, 'seed', 'sip');
+    this.db.prepare('UPDATE sessions SET telephone=? WHERE id=?').run(JSON.stringify({ ...session.telephone, provider: 'aliyun_udp_trunk' }), session.id);
+    return this.session(session.id)!;
+  }
   private insertSession(customer: Customer, mode: Session['mode'], transport: 'browser' | 'sip'): Session {
     const config = this.config();
     const prompt = buildPrompt(customer, config);
@@ -276,7 +281,7 @@ export class Store {
     const session = this.session(id);
     if (!session || session.transport !== 'sip' || !session.telephone) return undefined;
     const old = session.telephone;
-    if ((patch.provider !== undefined && patch.provider !== 'aliyun_ccc') || (patch.gateway !== undefined && patch.gateway !== 'siphon')) return undefined;
+    if ((patch.provider !== undefined && patch.provider !== old.provider) || (patch.gateway !== undefined && patch.gateway !== 'siphon')) return undefined;
     const states = ['prepared', 'dialing', 'ringing', 'answered', 'ended', 'busy', 'no_answer', 'rejected', 'cancelled', 'failed', 'unknown'] as const;
     if (patch.state !== undefined && !states.includes(patch.state)) return undefined;
     if (patch.recordingStatus !== undefined && !['pending', 'recording', 'ready', 'failed'].includes(patch.recordingStatus)) return undefined;
@@ -289,7 +294,7 @@ export class Store {
     const rank = (state: typeof old.state) => states.indexOf(state) < 4 ? states.indexOf(state) : 4;
     const allowed = new Set(['state', 'jobId', 'channelId', 'sipCallId', 'customerChannelId', 'endedReason', 'recordingStatus', 'cleanupStatus']);
     const defined = Object.fromEntries(Object.entries(patch).filter(([key, value]) => allowed.has(key) && value !== undefined));
-    const proposed = { ...old, ...defined, provider: 'aliyun_ccc' as const, gateway: 'siphon' as const };
+    const proposed = { ...old, ...defined, provider: old.provider, gateway: 'siphon' as const };
     if (terminal || (['completed', 'failed'].includes(session.status) && rank(proposed.state) < 4)
       || (patch.state !== undefined && rank(patch.state) < rank(old.state))) proposed.state = old.state;
     // Only telephoneAnswered can establish the answered state and its evidence together.
@@ -300,7 +305,7 @@ export class Store {
   }
   telephoneAnswered(id: string, evidence: { jobId: string; customerChannelId: string; at?: string }): Session | undefined {
     const session = this.session(id);
-    if (!session || session.mode !== 'seed' || session.transport !== 'sip' || !session.telephone
+    if (!session || session.mode !== 'seed' || session.transport !== 'sip' || session.telephone?.provider !== 'aliyun_ccc'
       || !session.telephone.jobId || session.telephone.jobId !== evidence.jobId || !evidence.customerChannelId?.trim()
       || evidence.customerChannelId.length > 1024 || /[\r\n\0]/.test(evidence.customerChannelId)
       || (session.telephone.customerChannelId && session.telephone.customerChannelId !== evidence.customerChannelId)) return undefined;
@@ -311,6 +316,17 @@ export class Store {
     const telephone = { ...session.telephone, state: 'answered' as const, customerChannelId: evidence.customerChannelId };
     this.db.prepare(`UPDATE sessions SET answered_at=?,answer_source='ccc_customer',telephone=? WHERE id=? AND answered_at IS NULL AND transport='sip'`)
       .run(new Date(time).toISOString(), JSON.stringify(telephone), id);
+    return this.session(id);
+  }
+  trunkAnswered(id: string, evidence: { channelId: string; sipCallId: string }): Session | undefined {
+    const session = this.session(id);
+    if (!session || session.transport !== 'sip' || session.telephone?.provider !== 'aliyun_udp_trunk'
+      || session.telephone.channelId !== evidence.channelId || session.telephone.sipCallId !== evidence.sipCallId
+      || !evidence.channelId || !evidence.sipCallId || ['completed', 'failed'].includes(session.status)
+      || !['prepared', 'dialing', 'ringing', 'answered'].includes(session.telephone.state)) return undefined;
+    if (session.answeredAt) return session;
+    this.db.prepare("UPDATE sessions SET answered_at=?,answer_source='sip_gateway',telephone=? WHERE id=? AND answered_at IS NULL")
+      .run(new Date().toISOString(), JSON.stringify({ ...session.telephone, state: 'answered' }), id);
     return this.session(id);
   }
   markModelReady(id: string) {

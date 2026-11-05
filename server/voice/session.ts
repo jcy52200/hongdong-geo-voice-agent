@@ -269,7 +269,7 @@ export class VoiceSessionManager {
     const call = this.live.get(id);
     const session = this.store.session(id);
     if (!call?.cloudId || !session || session.status !== 'connecting') return;
-    if (session.transport === 'sip' && (!session.answeredAt || session.answerSource !== 'ccc_customer')) return;
+    if (session.transport === 'sip' && (!session.answeredAt || !['ccc_customer', 'sip_gateway'].includes(session.answerSource ?? ''))) return;
     this.state(id, 'opening');
     const openingText = getOpening(session.configSnapshot, session.customer);
     this.send(id, { type: 'transcript', transcript: this.store.transcript(id, 'opening', 'ChatText', openingText, true) });

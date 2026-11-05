@@ -47,6 +47,10 @@ export class SiphonControl implements GatewayControl {
       return result && typeof result === 'object' ? result as Record<string, unknown> : {};
     } catch { throw new Error(`电话网关 ${verb} 未确认；请核对资源状态`); }
   }
+  async originate(args: Record<string, unknown>) {
+    try { return await this.client.command('sip', 'originate', null, args) as Record<string, unknown>; }
+    catch { throw new Error('SIP外呼结果未确认，禁止自动重拨，请核对网关通道'); }
+  }
   async registrations() {
     try {
       // This is a substrate verb (no module/target), as in SipClient.everyPage.

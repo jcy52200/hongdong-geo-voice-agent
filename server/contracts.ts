@@ -1,6 +1,6 @@
 // Versioned interfaces for the local workbench and the future SIP gateway.
 export const INTEGRATION_CONTRACTS = {
-  version: '2.4',
+  version: '2.5',
   crm: {
     status: 'json_import_ready', endpoint: 'POST /api/customers/import',
     body: { customers: [{ camp: '客户公司', name: '联系人', phone: '字符串号码', address: '城市/地址', industry: '可选行业' }] },
@@ -29,6 +29,15 @@ export const INTEGRATION_CONTRACTS = {
     playback: 'playbacks记录网关playing/played的RTP发出事实，不能证明手机已听到或听完整句',
     recordings: 'RecordingFinished后归档双方PCM16 WAV；来源与完整性保留；浏览器不得写入电话录音',
     readiness: '本地协议与UDP媒体回环已验证；ECS部署、阿里终端注册和真实手机验收待配置',
+  },
+  udpTrunkPilot: {
+    status: 'implemented_ecs_synthetic_validation', implemented: true, liveAcceptance: 'pending_provider_parameters',
+    entrypoint: 'npm run trunk:doctor -- --online；npm run trunk:pilot -- --dial --sample；ECS包装命令geo',
+    transport: 'IP-authenticated UDP gateway, provider port 8000 confirmed by support; no SIP registration or CCC MakeCall',
+    prerequisite: '阿里批准的主叫、SBC/网段、SP/URI格式、IP鉴权、late offer和200代表客户接通的明确确认',
+    media: 'same VoiceSessionManager / MediaPort; anchored late-offer SIP then authenticated WS bridge; independent WAV archive',
+    answer: 'correlated SIP answered event → answerSource=sip_gateway；183早媒体不计接通',
+    limit: '人工单通、固定测试手机、未知不重拨；不实现第三阶段调度或业务外呼API',
   },
   dialer: {
     status: 'reserved', implemented: false,

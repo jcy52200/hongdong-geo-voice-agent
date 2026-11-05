@@ -60,7 +60,7 @@ npm start
 | 首句不可打断 | 先静音模型输入，等服务端音频完成及播放端实际排空确认后解锁 |
 | 文本与生命周期 | SQLite 持久化；增量更新同一行、终态覆盖；断线/重启明确结束 |
 | 第一次架构重构 | 通用语音核心与浏览器媒体端口分离；独立只读观察；共享类型与历史接通来源迁移 |
-| 第一板块 | JSON 导入、CCC 人工单通与 Siphon 电话适配已实现并本地验证；真实注册/首通待验，CRM 提取与批量调度待第三次任务 |
+| 第一板块 | JSON 导入、CCC 保留通道及 UDP 网关人工单通已实现；ECS 部署与合成通话通过，阿里公网参数/真实首通待验；CRM 提取与批量调度待第三次任务 |
 | 第三板块 | DeepSeek 行业补全、持久化分析队列、A–G 带证据意向评估、分页筛选与详情 |
 | 通话录音 | 浏览器双向混音；Siphon 双声道线路 WAV 完成后归档，支持详情回放与来源区分 |
 
@@ -77,6 +77,8 @@ npm start
 - [三次重构任务、范围与验收（控制平面最后实施）](docs/refactor-tasks.md)
 - [第二次：人工单通测试、ECS 配置与现场验收](docs/telephone-pilot.md)
 - [真实电话测试：外接信息、端口协议和最新准备检查](docs/real-call-readiness.md)
+- [当前路线：UDP 8000 售后交接表模板](docs/aliyun-udp-handoff-template.md)
+- [ECS 无域名访问、通路配置和人工单通命令](docs/ecs-ip-only-runbook.md)
 - [Siphon 锁版本、排空补丁与真实 UDP 回环验证](docs/siphon-poc.md)
 - [阿里 CCC API 参数、客户腿证据与凭证边界](docs/aliyun-api-notes.md)
 - [完整销售提示词](prompts/sales-agent.md)

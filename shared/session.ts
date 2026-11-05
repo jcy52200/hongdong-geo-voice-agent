@@ -29,10 +29,10 @@ export type SessionStatus = 'created' | 'connecting' | 'opening' | 'active' | 'c
 /** softphone_bridge is read-only provenance for the retired demo. */
 export type SessionTransport = 'browser' | 'softphone_bridge' | 'sip';
 /** A telephone answer requires the matched CCC customer leg, independently of model readiness. */
-export type AnswerSource = 'browser_session' | 'legacy_browser_session' | 'legacy_softphone_bridge' | 'ccc_customer';
+export type AnswerSource = 'browser_session' | 'legacy_browser_session' | 'legacy_softphone_bridge' | 'ccc_customer' | 'sip_gateway';
 
 export interface Telephone {
-  provider: 'aliyun_ccc';
+  provider: 'aliyun_ccc' | 'aliyun_udp_trunk';
   gateway: 'siphon';
   state: 'prepared' | 'dialing' | 'ringing' | 'answered' | 'ended' | 'busy' | 'no_answer' | 'rejected' | 'cancelled' | 'failed' | 'unknown';
   jobId?: string;

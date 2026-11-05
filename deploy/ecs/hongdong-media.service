@@ -1,0 +1,26 @@
+[Unit]
+Description=Hongdong GEO patched RTP media engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hongdong
+Group=hongdong
+EnvironmentFile=/etc/hongdong-geo/voice.env
+UnsetEnvironment=SIPHON_RTP_CONTROL_SECRET
+ExecStart=/opt/hongdong-geo/runtime/siphon-rtp --control 127.0.0.1:8080 --control-secret-file /etc/hongdong-geo/rtp-control.secret --relay-bind-ip ${ECS_PRIVATE_IP} --advertise-ip ${ECS_PUBLIC_IP} --port-min 30000 --port-max 30199
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hongdong-geo
+MemoryMax=192M
+CPUWeight=50
+
+[Install]
+WantedBy=multi-user.target

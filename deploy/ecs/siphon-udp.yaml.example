@@ -1,0 +1,35 @@
+# Outbound-only IP-authenticated UDP trunk. No registrar, TLS, or public web domain.
+listen:
+  udp:
+    - address: "${ECS_PRIVATE_IP}:5060"
+      advertise: "${ECS_PUBLIC_IP}"
+domain:
+  local: ["${ECS_PUBLIC_IP}"]
+advertised_address: "${ECS_PUBLIC_IP}"
+script:
+  path: "${SIPHON_ROUTE_FILE}"
+control:
+  listen: "127.0.0.1:9092"
+  apps:
+    - name: hongdong-pilot
+      token: "${SIPHON_CONTROL_TOKEN}"
+  limits:
+    event_queue_depth: 1024
+    reattach_grace_secs: 5
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "127.0.0.1:8080"
+    timeout_ms: 3000
+    control_secret: "${SIPHON_RTP_CONTROL_SECRET}"
+  profiles:
+    hongdong_voice:
+      offer: &voice
+        ws_sample_rate: 16000
+        ws_barge_in: false
+        ws_vad: false
+      answer: *voice
+admin:
+  listen: "127.0.0.1:8081"
+log:
+  level: info
