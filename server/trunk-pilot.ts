@@ -41,7 +41,7 @@ try {
       const recordingPath = resolve(process.env.GEO_RECORDINGS_PATH || `${dirname(databasePath)}/recordings`);
       runtime = createApp({ databasePath, recordingsPath: recordingPath, apiKey: process.env.SEED_API_KEY,
         webSearchKey: process.env.SEED_WEBSEARCH_API_KEY, deepseekApiKey: process.env.DEEPSEEK_API_KEY,
-        deepseekBaseUrl: process.env.DEEPSEEK_BASE_URL, deepseekModel: process.env.DEEPSEEK_MODEL });
+        deepseekBaseUrl: process.env.DEEPSEEK_BASE_URL, deepseekSearchBaseUrl: process.env.DEEPSEEK_SEARCH_BASE_URL, deepseekModel: process.env.DEEPSEEK_MODEL });
       await new Promise<void>((resolve, reject) => { runtime!.server.once('error', reject); runtime!.server.listen(port, '127.0.0.1', resolve); });
       const national = (phone: string) => phone.replace(/^(?:\+86|0086)/, '').replace(/[\s()-]/g, '');
       let customer = customerId ? runtime.store.customer(customerId) : runtime.store.customers().find(item => national(item.phone) === national(config.testPhone));

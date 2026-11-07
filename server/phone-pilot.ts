@@ -84,7 +84,7 @@ async function dial() {
     await media.listen(config.mediaPort, config.mediaBaseUrl);
     const databasePath = resolve(process.env.GEO_DATABASE_PATH || 'data/geo.sqlite');
     runtime = createApp({ databasePath, apiKey: process.env.SEED_API_KEY?.trim(), webSearchKey: process.env.SEED_WEBSEARCH_API_KEY?.trim(),
-      deepseekApiKey: process.env.DEEPSEEK_API_KEY?.trim(), deepseekModel: process.env.DEEPSEEK_MODEL?.trim(), deepseekBaseUrl: process.env.DEEPSEEK_BASE_URL?.trim(),
+      deepseekApiKey: process.env.DEEPSEEK_API_KEY?.trim(), deepseekModel: process.env.DEEPSEEK_MODEL?.trim(), deepseekBaseUrl: process.env.DEEPSEEK_BASE_URL?.trim(), deepseekSearchBaseUrl: process.env.DEEPSEEK_SEARCH_BASE_URL?.trim(),
       recordingsPath: process.env.GEO_RECORDINGS_PATH ? resolve(process.env.GEO_RECORDINGS_PATH) : undefined });
     await new Promise<void>((resolve, reject) => { runtime!.server.once('error', reject); runtime!.server.listen(port, '127.0.0.1', resolve); });
     const phoneKey = (value: string) => value.replace(/^(?:\+86|0086)/, '').replace(/[\s()-]/g, '');

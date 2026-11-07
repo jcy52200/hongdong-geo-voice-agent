@@ -1,4 +1,5 @@
 import type { Customer } from './types.js';
+import { competitorArea, knownIndustry, spokenCompetitorNames } from '../shared/competitors.js';
 
 /** Operator-supplied sales copy, not independently verified product claims. */
 export const SALES_FAQS = [
@@ -35,7 +36,7 @@ export const SALES_FAQS = [
   {
     id: 'visibility',
     intent: '搜索到的概率、曝光保障和数据查询',
-    patterns: [/(?:保证|确保|百分之百|100%|每次|一定).*(?:搜到|搜索|找到|推荐|曝光|展示)/, /(?:曝光率|能.*搜到|搜得到|查.*数据|数据看板|怎么.*查.*效果)/],
+    patterns: [/(?:保证|确保|百分之百|100%|每次|一定).*(?:搜到|搜索|找到|推荐|曝光|展示)/, /(?:曝光率|能.*搜到|搜得到|查.*数据|数据看板|怎么.*查.*效果)/, /100[%％]|百分之?百|能保证|可以保证|能确保/],
     answer: '嗯这个的话，只要是咱们确认好去做的问答词，曝光率基本都能做到80%以上。咱们还有实时数据看板，客户怎么问的、有没有展示咱们电话，这些您都随时能查。',
   },
   {
@@ -65,13 +66,19 @@ export const SALES_FAQS = [
   {
     id: 'implementation',
     intent: '具体实现方法和底层原理',
-    patterns: [/怎么实现|底层|原理|技术上.*做|怎么做到|如何做到|具体怎么做/],
+    patterns: [/怎么实现|底层|原理|技术上.*做|怎么做|怎么弄|如何做|怎样做|怎么操作|怎么搞|靠什么实现/],
     answer: '我们这边主要是通过在新浪，搜狐这类权威媒体，以及咱们行业垂向的新闻媒体发文，还有就是帮咱们发一些比如说小红书和抖音的内容，以及结构化的官网部署这些方式来在ai里面提高咱们的提及率的。',
+  },
+  {
+    id: 'competition',
+    intent: '当地同行、做与不做的影响、先后时机犹豫',
+    patterns: [/竞对|竞争对手|同行.*(?:做|影响|客户|抢|先)|不做.*(?:影响|后果)|为什么(?:现在)?要做|为啥要做|有必要|必须做吗|以后再说|晚点再做|等等再做/],
+    answer: '嗯，比如当地同行先把企业和产品资料整理好，让AI更容易了解他们，客户询问时就有可能先看到他们。这个是举个假设例子，没确认哪家已经做了GEO。',
   },
   {
     id: 'explanation',
     intent: '推广是什么、做什么、没有使用过 AI',
-    patterns: [/什么.*推广|推广.*(?:啥|什么)|什么意思|(?:具体|到底).*(?:干啥|干嘛|干什么|做什么|做啥)|你们.*(?:干嘛|干啥|做什么的|做啥的)|(?:这是|这个是|到底是).*(?:啥|什么)|没用过.*(?:AI|ai|豆包)|不懂.*(?:AI|ai|豆包)|介绍一下|简单介绍|听不懂/],
+    patterns: [/什么.*推广|推广.*(?:啥|什么)|什么意思|做什么的|做啥的|干什么的|(?:具体|到底).*(?:干啥|干嘛|干什么|做什么|做啥)|你们.*(?:干嘛|干啥|做什么的|做啥的)|(?:这是|这个是|到底是).*(?:啥|什么)|没用过.*(?:AI|ai|豆包)|不懂.*(?:AI|ai|豆包)|介绍一下|简单介绍|听不懂|再.*(?:解释|说明|讲一下)|举.*例/],
     answer: '啊是这样的，您看以前大家找厂家都是上百度搜，但是现在越来越多老板和采购改用豆包这些AI软件直接问了，对吧？那咱们这边做的就是把您的产品优势，写成图文视频铺到全网。这样客户一问AI哪家好时候，AI呢就会把咱们公司当成标准答案给推荐出去。',
   },
 ] as const;
@@ -80,11 +87,26 @@ export type SalesFaqId = typeof SALES_FAQS[number]['id'];
 
 export function identifySalesFaq(text: string): SalesFaqId | undefined {
   const normalized = text.replace(/\s/g, '');
+  // Specific obligations/questions win over broad company or product keywords.
+  const managed = SALES_FAQS.find(faq => faq.id === 'managedService')!;
+  if (/自己|配合|托管|维护|没时间弄/.test(normalized) && managed.patterns.some(pattern => pattern.test(normalized))) return 'managedService';
+  if (/100[%％]|百分之?百|能保证|可以保证|能确保/.test(normalized)) return 'visibility';
+  if (/怎么实现|怎么做|怎么弄|如何做|怎样做|底层|原理/.test(normalized)) return 'implementation';
   return SALES_FAQS.find(faq => faq.patterns.some(pattern => pattern.test(normalized)))?.id;
 }
 
-export function buildSalesFaqAnswer(id: SalesFaqId, _customer?: Customer): string {
+export function buildSalesFaqAnswer(id: SalesFaqId, customer?: Customer, question = ''): string {
+  if (id === 'competition' && customer) return buildCompetitorScenario(customer);
+  if (id === 'visibility' && /100[%％]|百分之?百/.test(question)) return `嗯，这个不能保证百分之百。${SALES_FAQS.find(faq => faq.id === id)!.answer}`;
   return SALES_FAQS.find(faq => faq.id === id)!.answer;
+}
+
+export function buildCompetitorScenario(customer: Customer): string {
+  const names = spokenCompetitorNames(customer);
+  const area = competitorArea(customer.address) ?? '当地';
+  const industry = knownIndustry(customer.industry) ?? '这类产品和服务';
+  if (!names.length) return SALES_FAQS.find(faq => faq.id === 'competition')!.answer;
+  return `嗯，比如在咱们${area}，要是${names.join('、')}这些同行先把GEO做起来了，咱们还没做，那客户问豆包哪家${industry}合适的时候，答案里就有可能先提到他们，咱们被看到的机会就少一些。`;
 }
 
 const instructionLike = /忽略|指令|提示词|系统|扮演|输出|执行|删除|读出|不要|请你|\b(?:prompt|ignore|system|instruction)\b/i;
@@ -138,10 +160,11 @@ export function buildInitialIntroduction(customer: Customer, template = INITIAL_
     camp: spokenField(customer.camp, '咱们公司', 80),
     name: spokenField(customer.name, '老板', 32),
     phone: /^\d{5,20}$/.test(phone) ? phone : '当前来电号码',
+    competitors: spokenCompetitorNames(customer).join('、') || '当地同行',
   };
   // Customer text remains data: inserted values are never scanned for tokens again.
   return (template.trim() || INITIAL_INTRODUCTION_TEMPLATE).replace(
-    /&(industry|address|camp|name|phone)(?![A-Za-z0-9_])/g,
+    /&(industry|address|camp|name|phone|competitors)(?![A-Za-z0-9_])/g,
     (_token, key: keyof typeof values) => values[key],
   );
 }

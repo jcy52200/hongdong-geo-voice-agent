@@ -33,6 +33,7 @@ test('固定首句逐字一致；提示词可重放，客户字符串不发生�
   assert.deepEqual(customerData(prompt), {
     id: special.id, '&camp': special.camp, '&name': special.name,
     '&phone': special.phone, '&address': special.address, '&industry': '待确认行业', industry: null,
+    '&competitors': '', competitors: [], competitorArea: null, competitorCheckedAt: null,
   });
   assert.equal(customerData(buildPrompt({ ...special, industry: '门窗' }, config)).industry, '门窗');
   assert.notEqual(prompt, buildPrompt({ ...special, industry: '门窗' }, config));
@@ -53,6 +54,7 @@ test('重复导入同一格式化电话更新客户资料，保留客户身份�
   assert.equal(updated.length, 2);
   assert.deepEqual(store.customer(oldCustomer.id), {
     id: oldCustomer.id, camp: '新公司', name: '新姓名', phone: '13800000001', address: '石家庄', industry: '门窗',
+    competitorStatus: 'pending',
   });
   assert.equal(updated.find(row => row.camp === '另一个公司')?.phone, '+8613900000002');
 

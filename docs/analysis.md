@@ -16,6 +16,8 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 
 密钥只在后端 Authorization 头使用，不传到浏览器，不写入提示词或导出结果。未配置密钥时任务保留 `pending`，不会生成假分析。界面“已配置”仅表示存在环境变量，不代表已验证鉴权、额度或实际模型效果。
 
+本地同行查询现已接入现有后台消费者，详见[同行来源、队列与话术说明](competitors.md)。查询在行业补全之后执行，复用 DeepSeek Key，增加 `&competitors`；不是 SeedDuplex 自带联网参数。
+
 ## 行业补全
 
 1. 导入客户 JSON，统一校验后按规范化电话保存。保留输入的其他客户字段，再新增或更新 `industry`；内部 `id` 由服务端管理。
@@ -70,10 +72,11 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 
 | 接口 | 用途 |
 | --- | --- |
-| `POST /api/customers/import` | 导入客户并自动入队补全行业；body 为 `{ "customers": [...] }` |
-| `POST /api/customers/enrich` | 重试缺失行业任务；body 可含 `{ "retryFailed": true }` |
-| `GET /api/customers/export` | 下载带行业的客户 JSON |
-| `GET /api/analysis/status` | 模型配置状态与通话/行业任务数量，不包含密钥 |
+| `POST /api/customers/import` | 导入客户并自动入队补全行业、查询本地同行；body 为 `{ "customers": [...] }` |
+| `POST /api/customers/enrich` | 补全行业，并查询未查/失败/资料不足的本地同行；body 可含 `{ "retryFailed": true }` |
+| `POST /api/customers/:id/competitors/research` | 为单个客户查询或重查本地同行，执行中复用已有任务 |
+| `GET /api/customers/export` | 下载带行业、本地同行和来源的客户 JSON |
+| `GET /api/analysis/status` | 模型配置状态与通话/行业/同行任务数量，不包含密钥 |
 | `GET /api/sessions` | 分页查询，返回 `{ items, total, page, pageSize }`；列表不携带整通转写 |
 | `GET /api/sessions/:id` | 完整详情、转写、分析状态/结果与录音元数据 |
 | `POST /api/sessions/:id/analyze` | 将已接通且已结束的语音通话重新入队；其他会话返回 409 |

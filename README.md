@@ -2,7 +2,7 @@
 
 **Hongdong GEO Voice Agent** · 面向 GEO 业务的本地 AI 语音销售智能体。
 
-本地运行的 Web 项目，已实现 SeedDuplex 语音智能体和 DeepSeek 行业补全、通话意向分析。支持 CRM JSON 导入、逐通提示词快照、文字预演、实时语音试打、分页通话记录、客户原话证据与真实录音回放。FreeSWITCH 自动外呼保留接入契约，尚未拨打真实客户电话。
+本地运行的 Web 项目，已实现 SeedDuplex 语音智能体和 DeepSeek 行业补全、本地同行联网查询、通话意向分析。支持 CRM JSON 导入、逐通提示词快照、文字预演、实时语音试打、分页通话记录、客户原话证据与真实录音回放。FreeSWITCH 自动外呼保留接入契约，尚未拨打真实客户电话。
 
 ## 启动
 
@@ -20,7 +20,7 @@ npm run dev
 
 真实语音：在本地 `.env` 中填写 `SEED_API_KEY`，重启服务，在“客户资料”中添加客户，然后选择 SeedDuplex 并点击连接，允许本地页面使用麦克风。推荐先戴耳机试听。API Key 仅由后端发送到火山引擎，不下发浏览器。这里的“已配置”仅说明环境变量存在，不表示鉴权、额度或模型权限已验证。
 
-行业与通话分析：在现有 `.env` 中补入 `DEEPSEEK_API_KEY` 并重启服务。默认 `DEEPSEEK_MODEL=deepseek-flash`，使用 DeepSeek 4.1 Flash 官方模型别名；无需覆盖现有 SeedDuplex 配置。无 DeepSeek 密钥时任务保留待处理，详情参见 [分析模块说明](docs/analysis.md)。
+行业、同行与通话分析：在现有 `.env` 中补入 `DEEPSEEK_API_KEY` 并重启服务。默认 `DEEPSEEK_MODEL=deepseek-flash`，使用 DeepSeek 4.1 Flash 官方模型别名；无需覆盖现有 SeedDuplex 配置。本地同行查询复用同一个 Key 调用官方 Search API，再由 Flash 筛选带来源的同城同行；无需新增供应商 Key。无 DeepSeek 密钥时任务保留待处理，详情参见 [分析模块说明](docs/analysis.md)。
 
 构建后使用一个本地服务运行：
 
@@ -39,11 +39,11 @@ npm start
 
 默认销售脚本已加入首轮拒绝介绍、年包服务内容和 9 类可随时插入的 FAQ，按客户语义回答，之后按进度邀请加微信或确认绑定电话。首轮简单说“不需要/不想了解”时作一次介绍；重复拒绝、要求结束或明确在忙时收尾。年包为 12800 元、全年累计一万多条内容和 3000 多个词汇；季度 3800 元仅在客户询问短期方案时补充。指定话术属于运营方提供的业务口径，未经项目独立核验，不能自行扩展承诺。详见 [销售脚本与快速回复说明](docs/sales-script.md)。
 
-“首轮拒绝快速回复”配置默认开启，使用官方 `replacement.commit` 控制，在首句解锁后的首个最终 ASR 符合条件时发送指定介绍，不额外调用 DeepSeek；状态不适合或已有回复时安全跳过，继续由正常提示词回应。它保留首句播放锁，不承诺真实云端响应时延。已知旧版默认模板会备份并升级；自定义完整提示词保持原样，需在配置页“恢复默认”后保存才采用新脚本。原有音色、开场、补充要求和历史会话快照保留。
+“首轮拒绝快速回复”配置默认开启，使用官方 `replacement.commit` 控制，在首句解锁后的首个最终 ASR 符合条件时发送指定介绍，不额外调用 DeepSeek；状态不适合或已有回复时安全跳过，继续由正常提示词回应。它保留首句播放锁，不承诺真实云端响应时延。已知旧版默认模板会备份并升级；自定义完整提示词正文保持原样；逐通附加的问题优先级和本地同行规则照常生效，正文需要新脚本时可在配置页“恢复默认”后保存。原有音色、开场、补充要求和历史会话快照保留。
 
 1. 在“客户资料”填入虚构示例，或导入自己的 CRM 导出文件。示例文件为 [examples/customers.json](examples/customers.json)，支持 JSON 数组或 `{ "customers": [...] }`。
 2. 在“限制词控制”配置称呼、音色、语速、音量、开场及其他模型参数，保存后用于新会话。默认云舟 2.0：`zh_male_m191_uranus_bigtts`。
-3. 选一位客户，查看已注入 `&camp`、`&name`、`&phone`、`&address`、`&industry` 的完整提示词。缺失行业由 DeepSeek 根据公司名称补全，含混名称填“未知”；手工行业优先，补全后可导出客户 JSON。
+3. 选一位客户，查看已注入 `&camp`、`&name`、`&phone`、`&address`、`&industry`、`&competitors` 的完整提示词。缺失行业由 DeepSeek 根据公司名称补全，含混名称填“未知”；手工行业优先，补全后可导出客户 JSON。同行查询完成后可查看名称与来源，场景优先级中上、每通主动使用一次；价格、保证和微信号码确认等具体问题优先回答。
 4. 先用文字模拟检查数据流，再用 SeedDuplex 做真实试听。文字模拟是有限规则，无语音模型推理，不代表真实模型效果或完整语义理解。
 5. 结束后等待录音保存，在“通话记录”按日期、等级筛选和分页，查看直观对话、A–G 意向评估及客户原话证据，播放原录音或导出 JSON。仅接通的语音试打参与评估，文字模拟排除；本地联调记录不等于已经拨打客户电话。
 
@@ -61,7 +61,7 @@ npm start
 | 文本与生命周期 | SQLite 持久化；增量更新同一行、终态覆盖；断线/重启明确结束 |
 | 第一次架构重构 | 通用语音核心与浏览器媒体端口分离；独立只读观察；共享类型与历史接通来源迁移 |
 | 第一板块 | JSON 导入、CCC 保留通道及 UDP 网关人工单通已实现；ECS 部署与合成通话通过，阿里公网参数/真实首通待验；CRM 提取与批量调度待第三次任务 |
-| 第三板块 | DeepSeek 行业补全、持久化分析队列、A–G 带证据意向评估、分页筛选与详情 |
+| 第三板块 | DeepSeek 行业补全、本地同行检索与来源、持久化分析队列、A–G 带证据意向评估、分页筛选与详情 |
 | 通话录音 | 浏览器双向混音；Siphon 双声道线路 WAV 完成后归档，支持详情回放与来源区分 |
 
 浏览器试听会播放声音，电话链路通过独立网关连接同一语音核心，不走本机扬声器。当前使用锁版本并打补丁的 Siphon，已验证双向 UDP/RTP、首句排空与双声道 WAV；阿里平台终端注册和手机首通尚未验收。工程测试入口只允许人工发起一通固定测试号码，见[电话测试操作说明](docs/telephone-pilot.md)。当前没有自动业务挂机工具；可用工作台“结束本次测试”、CLI 的 Ctrl+C、客户信令挂断或10分钟上限收尾。独立观察连接断开只取消观察。文字模拟可在结束分支自动收束。
@@ -87,6 +87,7 @@ npm start
 - [模型参数及实时控制说明](docs/model-controls.md)
 - [SeedDuplex 新版协议与事件映射](docs/seeduplex.md)
 - [DeepSeek 行业补全、等级、队列、录音与 API](docs/analysis.md)
+- [本地同行联网查询、竞对变量与问答优先级](docs/competitors.md)
 - [第一板块接入与已实现分析契约](server/contracts.ts)：`GET /api/integrations/contracts`
 
 主要 API：`GET /api/bootstrap`、`PUT /api/config`、`POST /api/prompt/preview`、`POST /api/customers/import`、`GET /api/customers/export`、`POST /api/customers/enrich`、`GET /api/analysis/status`、`GET /api/sessions`、`POST /api/sessions`、`GET /api/sessions/:id`、`POST /api/sessions/:id/finish`、`POST /api/sessions/:id/analyze`、`GET /api/sessions/:id/recording`、`GET /api/sessions/:id/export`。本地媒体协议为 `/ws/sessions/:id`，一个新建会话只接受一个媒体客户端；中断后新建测试，不重放旧音频。独立只读 `/ws/sessions/:id/observe` 接收会话快照、状态与转写，不接收播放音频；断开仅取消观察，任何入站消息仅关闭该观察连接。

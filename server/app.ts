@@ -30,10 +30,10 @@ function localRequest(req: IncomingMessage) {
   } catch { return false; }
 }
 export function createApp(options: { databasePath: string; apiKey?: string; seedUrl?: string; staticPath?: string; webSearchKey?: string;
-  deepseekApiKey?: string; deepseekBaseUrl?: string; deepseekModel?: string; recordingsPath?: string }) {
+  deepseekApiKey?: string; deepseekBaseUrl?: string; deepseekSearchBaseUrl?: string; deepseekModel?: string; recordingsPath?: string }) {
   const store = new Store(options.databasePath);
   const manager = new SessionManager(store, options.apiKey ?? '', options.seedUrl, options.webSearchKey);
-  const worker = new AnalysisWorker(store, options.deepseekApiKey ? new DeepSeekClient({ apiKey: options.deepseekApiKey, baseUrl: options.deepseekBaseUrl, model: options.deepseekModel }) : undefined);
+  const worker = new AnalysisWorker(store, options.deepseekApiKey ? new DeepSeekClient({ apiKey: options.deepseekApiKey, baseUrl: options.deepseekBaseUrl, searchBaseUrl: options.deepseekSearchBaseUrl, model: options.deepseekModel }) : undefined);
   const recordings = new Recordings(options.recordingsPath ?? resolve(options.databasePath === ':memory:' ? 'data' : dirname(options.databasePath), 'recordings'));
   const app = express();
   let stopping = false;
@@ -72,13 +72,23 @@ export function createApp(options: { databasePath: string; apiKey?: string; seed
   });
   app.get('/api/customers/export', (_req, res) => {
     res.setHeader('Content-Disposition', 'attachment; filename="customers.json"');
-    res.json({ customers: store.customers().map(({ industryStatus, industryError, ...customer }) => customer) });
+    res.json({ customers: store.customers().map(({ industryStatus, industryError, competitorStatus, competitorError, ...customer }) => customer) });
   });
   app.post('/api/customers/enrich', (req, res) => {
     const { retryFailed } = z.object({ retryFailed: z.boolean().default(true) }).parse(req.body ?? {});
-    for (const customer of store.customers()) if (!customer.industry?.trim() || (retryFailed && customer.industryStatus === 'failed')) store.enqueueIndustry(customer, true);
+    for (const customer of store.customers()) {
+      if (!customer.industry?.trim() || (retryFailed && customer.industryStatus === 'failed')) store.enqueueIndustry(customer, true);
+      if (!customer.competitorStatus || (retryFailed && ['failed', 'skipped'].includes(customer.competitorStatus))) store.enqueueCompetitors(customer, true);
+    }
     worker.wake();
     res.status(202).json(worker.status());
+  });
+  app.post('/api/customers/:id/competitors/research', (req, res) => {
+    const customer = store.customer(req.params.id);
+    if (!customer) { res.status(404).json({ error: '客户不存在' }); return; }
+    if (!['pending', 'running'].includes(customer.competitorStatus ?? '')) store.enqueueCompetitors(customer, true);
+    worker.wake();
+    res.status(202).json({ customer: store.customer(customer.id), analysis: worker.status() });
   });
   app.get('/api/analysis/status', (_req, res) => res.json(worker.status()));
   app.get('/api/dashboard', (req, res) => {

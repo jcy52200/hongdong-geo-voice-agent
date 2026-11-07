@@ -1,5 +1,6 @@
 import type { AnalysisStatus, CallAnalysis } from './analysis.js';
 import type { ModelOptions } from './model-config.js';
+import type { Competitor, CompetitorStatus } from './competitors.js';
 
 export interface Customer {
   id: string;
@@ -10,6 +11,12 @@ export interface Customer {
   industry?: string;
   industryStatus?: 'pending' | 'running' | 'completed' | 'failed';
   industryError?: string;
+  competitors?: Competitor[];
+  competitorStatus?: CompetitorStatus;
+  competitorError?: string;
+  competitorNote?: string;
+  competitorArea?: string;
+  competitorCheckedAt?: string;
 }
 
 export interface AgentConfig {
@@ -23,6 +30,7 @@ export interface AgentConfig {
   modelOptions?: ModelOptions;
   quickReplyEnabled?: boolean;
   quickReplyText?: string;
+  competitorPressureEnabled?: boolean;
 }
 
 export type SessionStatus = 'created' | 'connecting' | 'opening' | 'active' | 'completed' | 'failed';

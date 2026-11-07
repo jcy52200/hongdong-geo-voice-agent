@@ -42,6 +42,13 @@ export class AnalysisWorker {
         for (const job of industries) this.store.failIndustry(job, this.message(error), this.stopping ? new Date().toISOString() : this.retry(job.attempts, error));
       }
     }
+    if (this.stopping) return;
+    // One company per iteration; finished-call analysis keeps first priority.
+    const competitor = this.store.claimCompetitor();
+    if (competitor) {
+      try { this.store.completeCompetitors(competitor, await client.researchCompetitors(competitor, this.controller.signal)); }
+      catch (error) { this.store.failCompetitors(competitor, this.message(error), this.stopping ? new Date().toISOString() : this.retry(competitor.attempts, error)); }
+    }
   }
   private message(error: unknown) { return error instanceof Error ? error.message.slice(0, 300) : 'DeepSeek 分析失败，请重试'; }
   async close() { this.stopping = true; clearTimeout(this.timer); this.controller.abort(); await this.task; }

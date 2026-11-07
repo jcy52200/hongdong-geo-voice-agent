@@ -6,12 +6,14 @@ import { buildPrompt, DEFAULT_SYSTEM_PROMPT, OPENING } from './prompt.js';
 import type { AgentConfig, Customer, Session, SessionStatus, Transcript } from './types.js';
 import type { CallAnalysis } from '../shared/analysis.js';
 import { INITIAL_INTRODUCTION_TEMPLATE } from './sales-script.js';
+import type { CompetitorResearch } from '../shared/competitors.js';
 
 export const DEFAULT_CONFIG: AgentConfig = {
   agentName: '小泓', voice: 'zh_male_m191_uranus_bigtts', speed: 0, extraInstructions: '',
   systemPrompt: DEFAULT_SYSTEM_PROMPT, loudness: 0, opening: OPENING, modelOptions: {},
   quickReplyEnabled: true,
   quickReplyText: INITIAL_INTRODUCTION_TEMPLATE,
+  competitorPressureEnabled: true,
 };
 type Row = Record<string, any>;
 export interface SessionQuery {
@@ -21,6 +23,7 @@ export interface SessionQuery {
   sortBy: 'createdAt' | 'status' | 'grade'; sortDir: 'asc' | 'desc'; grade?: string; search?: string;
 }
 export interface IndustryJob { customerId: string; camp: string; attempts: number }
+export interface CompetitorJob { customerId: string; camp: string; address: string; industry: string; revision: string; attempts: number }
 export class Store {
   readonly db: DatabaseSync;
   constructor(path: string) {
@@ -61,6 +64,11 @@ export class Store {
         status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT,
         next_attempt TEXT, updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS competitor_jobs (
+        customer_id TEXT PRIMARY KEY REFERENCES customers(id), input_key TEXT NOT NULL, input TEXT NOT NULL,
+        revision TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+        error TEXT, note TEXT, next_attempt TEXT, updated_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_transcripts_session ON transcripts(session_id);
       CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at);
@@ -79,7 +87,8 @@ export class Store {
       UPDATE sessions SET analysis_status='not_requested' WHERE answered_at IS NULL;
       UPDATE analysis_jobs SET status='pending' WHERE status='running';
       UPDATE sessions SET analysis_status='pending' WHERE analysis_status='running';
-      UPDATE industry_jobs SET status='pending' WHERE status='running';`);
+      UPDATE industry_jobs SET status='pending' WHERE status='running';
+      UPDATE competitor_jobs SET status='pending' WHERE status='running';`);
     // A restarted process cannot know whether an external CCC/SIP resource is still alive.
     // Retain correlation IDs, mark it unknown, and never automatically resume or redial it.
     for (const row of this.db.prepare(`SELECT id,telephone FROM sessions WHERE transport='sip' AND status IN ('created','connecting','opening','active')`).all() as Row[]) {
@@ -126,15 +135,17 @@ export class Store {
     const config: AgentConfig = JSON.parse(row.value);
     if (!config.systemPrompt) return; // A missing prompt already follows the current default.
     const hash = createHash('sha256').update(config.systemPrompt.trim()).digest('hex');
-    // Only the two shipped defaults are eligible; never overwrite an edited prompt.
+    // Only exact shipped defaults are eligible; never overwrite an edited prompt.
     const shippedDefaults = new Set([
       '76b9d71b82d1736083b9c9c8212c83d53a50bc26fb55acca31b7b3512d17637b',
       '57d875f7958a82c08d48336825810cd5b5535332d694bb4eefcb966c1197f07b',
+      '894d0cef62f774223d9c26642c3265b0867b827239193a0aaa3c8d60029e5ee3',
     ]);
     if (!shippedDefaults.has(hash)) return;
     this.db.exec('BEGIN');
     try {
-      this.db.prepare('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)').run('agent_backup_2026-11-02-faq', row.value);
+      const backupKey = hash === '894d0cef62f774223d9c26642c3265b0867b827239193a0aaa3c8d60029e5ee3' ? 'agent_backup_2026-11-07-local-competitors' : 'agent_backup_2026-11-02-faq';
+      this.db.prepare('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)').run(backupKey, row.value);
       this.saveConfig({ ...config, systemPrompt: DEFAULT_SYSTEM_PROMPT });
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
@@ -151,15 +162,18 @@ export class Store {
     const customer = JSON.parse(row.data);
     if (row.industry_status) customer.industryStatus = row.industry_status;
     if (row.industry_error) customer.industryError = row.industry_error;
+    if (row.competitor_status) customer.competitorStatus = row.competitor_status;
+    if (row.competitor_error) customer.competitorError = row.competitor_error;
+    if (row.competitor_note) customer.competitorNote = row.competitor_note;
     return customer;
   }
   customers(): Customer[] {
-    return (this.db.prepare(`SELECT c.data,j.status AS industry_status,j.error AS industry_error FROM customers c
-      LEFT JOIN industry_jobs j ON j.customer_id=c.id ORDER BY c.rowid DESC`).all() as Row[]).map(row => this.customerRow(row));
+    return (this.db.prepare(`SELECT c.data,j.status AS industry_status,j.error AS industry_error,r.status AS competitor_status,r.error AS competitor_error,r.note AS competitor_note FROM customers c
+      LEFT JOIN industry_jobs j ON j.customer_id=c.id LEFT JOIN competitor_jobs r ON r.customer_id=c.id ORDER BY c.rowid DESC`).all() as Row[]).map(row => this.customerRow(row));
   }
   customer(id: string): Customer | undefined {
-    const row = this.db.prepare(`SELECT c.data,j.status AS industry_status,j.error AS industry_error FROM customers c
-      LEFT JOIN industry_jobs j ON j.customer_id=c.id WHERE c.id=?`).get(id) as Row | undefined;
+    const row = this.db.prepare(`SELECT c.data,j.status AS industry_status,j.error AS industry_error,r.status AS competitor_status,r.error AS competitor_error,r.note AS competitor_note FROM customers c
+      LEFT JOIN industry_jobs j ON j.customer_id=c.id LEFT JOIN competitor_jobs r ON r.customer_id=c.id WHERE c.id=?`).get(id) as Row | undefined;
     return row ? this.customerRow(row) : undefined;
   }
   importCustomers(input: Omit<Customer, 'id'>[]): Customer[] {
@@ -170,12 +184,18 @@ export class Store {
         const existing = this.db.prepare('SELECT id,data FROM customers WHERE phone=?').get(normalizedPhone) as Row | undefined;
         const old = existing ? JSON.parse(existing.data) as Customer : undefined;
         const industry = item.industry?.trim() || (old?.camp === item.camp ? old.industry : '') || '';
-        const { industryStatus: _status, industryError: _error, ...original } = item;
-        const customer: Customer = { ...original, phone: normalizedPhone, industry, id: existing?.id ?? randomUUID() };
+        // Imported research/status is not treated as verified web evidence. Preserve
+        // only server-owned research whose complete input is unchanged.
+        const { industryStatus: _status, industryError: _error, competitorStatus: _cs, competitorError: _ce,
+          competitors: _competitors, competitorArea: _ca, competitorCheckedAt: _cc, competitorNote: _cn, ...original } = item;
+        const sameResearchInput = old?.camp === item.camp && old.address === item.address && (old.industry ?? '') === industry;
+        const customer: Customer = { ...original, phone: normalizedPhone, industry, id: existing?.id ?? randomUUID(),
+          ...(sameResearchInput ? { competitors: old.competitors, competitorArea: old.competitorArea, competitorCheckedAt: old.competitorCheckedAt, competitorNote: old.competitorNote } : {}) };
         this.db.prepare(`INSERT INTO customers(id,phone,data) VALUES (?,?,?) ON CONFLICT(phone) DO UPDATE SET data=excluded.data`)
           .run(customer.id, customer.phone, JSON.stringify(customer));
         if (industry) this.db.prepare('DELETE FROM industry_jobs WHERE customer_id=?').run(customer.id);
         else this.enqueueIndustry(customer, old?.camp !== customer.camp);
+        this.enqueueCompetitors(customer);
       }
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
@@ -197,14 +217,53 @@ export class Store {
   completeIndustry(job: IndustryJob, industry: string) {
     const current = this.customer(job.customerId);
     if (!current || current.camp !== job.camp || current.industryStatus !== 'running') return;
-    const { industryStatus: _status, industryError: _error, ...data } = current;
+    const { industryStatus: _status, industryError: _error, competitorStatus: _cs, competitorError: _ce, ...data } = current;
     this.db.prepare('UPDATE customers SET data=? WHERE id=?').run(JSON.stringify({ ...data, industry }), current.id);
     this.db.prepare(`UPDATE industry_jobs SET status='completed',error=NULL,next_attempt=NULL,updated_at=? WHERE customer_id=? AND camp=?`)
       .run(new Date().toISOString(), job.customerId, job.camp);
+    this.enqueueCompetitors({ ...current, industry });
   }
   failIndustry(job: IndustryJob, error: string, retryAt?: string) {
     this.db.prepare(`UPDATE industry_jobs SET status=?,error=?,next_attempt=?,updated_at=? WHERE customer_id=? AND camp=? AND status='running'`)
       .run(retryAt ? 'pending' : 'failed', error, retryAt ?? null, new Date().toISOString(), job.customerId, job.camp);
+  }
+  private competitorInput(customer: Pick<Customer, 'camp' | 'address' | 'industry'>) {
+    return JSON.stringify({ camp: customer.camp, address: customer.address, industry: customer.industry ?? '' });
+  }
+  enqueueCompetitors(customer: Customer, force = false) {
+    const input = this.competitorInput(customer);
+    const key = createHash('sha256').update(input).digest('hex');
+    this.db.prepare(`INSERT INTO competitor_jobs(customer_id,input_key,input,revision,status,updated_at) VALUES (?,?,?,?,'pending',?)
+      ON CONFLICT(customer_id) DO UPDATE SET input_key=excluded.input_key,input=excluded.input,revision=excluded.revision,
+      status='pending',attempts=0,error=NULL,note=NULL,next_attempt=NULL,updated_at=excluded.updated_at
+      WHERE competitor_jobs.input_key!=excluded.input_key OR ?=1`)
+      .run(customer.id, key, input, randomUUID(), new Date().toISOString(), force ? 1 : 0);
+  }
+  claimCompetitor(): CompetitorJob | undefined {
+    const row = this.db.prepare(`SELECT r.* FROM competitor_jobs r LEFT JOIN industry_jobs j ON j.customer_id=r.customer_id
+      WHERE r.status='pending' AND (r.next_attempt IS NULL OR r.next_attempt<=?) AND (j.status IS NULL OR j.status NOT IN ('pending','running'))
+      ORDER BY r.updated_at,r.rowid LIMIT 1`).get(new Date().toISOString()) as Row | undefined;
+    if (!row) return;
+    this.db.prepare(`UPDATE competitor_jobs SET status='running',attempts=attempts+1 WHERE customer_id=? AND revision=?`).run(row.customer_id, row.revision);
+    return { ...JSON.parse(row.input), customerId: row.customer_id, revision: row.revision, attempts: row.attempts + 1 };
+  }
+  completeCompetitors(job: CompetitorJob, result: CompetitorResearch) {
+    const row = this.db.prepare(`SELECT revision,status FROM competitor_jobs WHERE customer_id=?`).get(job.customerId);
+    const current = this.customer(job.customerId);
+    if (!current || row?.revision !== job.revision || row?.status !== 'running' || this.competitorInput(current) !== this.competitorInput(job)) return;
+    const { industryStatus: _is, industryError: _ie, competitorStatus: _cs, competitorError: _ce, ...data } = current;
+    this.db.exec('BEGIN');
+    try {
+      this.db.prepare('UPDATE customers SET data=? WHERE id=?').run(JSON.stringify({ ...data, competitors: result.competitors,
+        competitorArea: result.area, competitorCheckedAt: result.checkedAt, competitorNote: result.note }), current.id);
+      this.db.prepare(`UPDATE competitor_jobs SET status=?,error=NULL,note=?,next_attempt=NULL,updated_at=? WHERE customer_id=? AND revision=?`)
+        .run(result.status, result.note, new Date().toISOString(), job.customerId, job.revision);
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  failCompetitors(job: CompetitorJob, error: string, retryAt?: string) {
+    this.db.prepare(`UPDATE competitor_jobs SET status=?,error=?,next_attempt=?,updated_at=? WHERE customer_id=? AND revision=? AND status='running'`)
+      .run(retryAt ? 'pending' : 'failed', error, retryAt ?? null, new Date().toISOString(), job.customerId, job.revision);
   }
   createSession(customer: Customer, mode: Session['mode']): Session {
     return this.insertSession(customer, mode, 'browser');
@@ -371,12 +430,16 @@ export class Store {
     this.db.prepare('UPDATE sessions SET analysis_status=? WHERE id=?').run(status, id);
   }
   jobCounts() {
-    const counts = { pending: 0, running: 0, failed: 0, industryPending: 0, industryRunning: 0, industryFailed: 0 };
+    const counts = { pending: 0, running: 0, failed: 0, industryPending: 0, industryRunning: 0, industryFailed: 0, competitorPending: 0, competitorRunning: 0, competitorFailed: 0 };
     for (const row of this.db.prepare('SELECT status,COUNT(*) AS count FROM analysis_jobs GROUP BY status').all() as Row[]) {
       if (row.status in counts) counts[row.status as 'pending' | 'running' | 'failed'] = Number(row.count);
     }
     for (const row of this.db.prepare('SELECT status,COUNT(*) AS count FROM industry_jobs GROUP BY status').all() as Row[]) {
       const key = ({ pending: 'industryPending', running: 'industryRunning', failed: 'industryFailed' } as const)[row.status as 'pending'];
+      if (key) counts[key] = Number(row.count);
+    }
+    for (const row of this.db.prepare('SELECT status,COUNT(*) AS count FROM competitor_jobs GROUP BY status').all() as Row[]) {
+      const key = ({ pending: 'competitorPending', running: 'competitorRunning', failed: 'competitorFailed' } as const)[row.status as 'pending'];
       if (key) counts[key] = Number(row.count);
     }
     return counts;

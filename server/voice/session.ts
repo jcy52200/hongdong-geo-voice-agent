@@ -84,7 +84,7 @@ export class VoiceSessionManager {
     call.deadline = setTimeout(() => this.fail(id, '单次测试已达到10分钟上限，请新建测试'), 10 * 60 * 1000);
     call.deadline.unref();
     if (session.mode === 'simulation') {
-      call.sim = new Simulation(session.customer);
+      call.sim = new Simulation(session.customer, session.configSnapshot);
       this.send(id, { type: 'transcript', transcript: this.store.transcript(id, 'opening', 'ChatText', getOpening(session.configSnapshot, session.customer), true) });
       this.state(id, 'active');
     } else {

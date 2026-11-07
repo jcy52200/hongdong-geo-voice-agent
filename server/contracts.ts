@@ -1,11 +1,15 @@
 // Versioned interfaces for the local workbench and the future SIP gateway.
 export const INTEGRATION_CONTRACTS = {
-  version: '2.5',
+  version: '2.6',
   crm: {
     status: 'json_import_ready', endpoint: 'POST /api/customers/import',
     body: { customers: [{ camp: '客户公司', name: '联系人', phone: '字符串号码', address: '城市/地址', industry: '可选行业' }] },
-    mappings: { '&camp': 'camp', '&name': 'name', '&phone': 'phone', '&address': 'address', '&industry': 'industry' },
-    enrichment: '缺失行业写入持久化队列；DeepSeek 按公司名补全，含混名称填未知；手工行业优先。GET /api/customers/export 导出补全后的原资料。',
+    mappings: { '&camp': 'camp', '&name': 'name', '&phone': 'phone', '&address': 'address', '&industry': 'industry', '&competitors': 'competitors[].name（最多2家，有来源的同城同行）' },
+    enrichment: '先补全行业，再调用DeepSeek Search API按城市/行业联网查询，Flash筛选并保留来源与原文证据；不知道则不点名。GET /api/customers/export导出原资料与补充结果。',
+    competitorResearch: { endpoint: 'POST /api/customers/:id/competitors/research', queue: 'competitor_jobs',
+      status: 'pending / running / completed / failed / skipped', source: '公开网页及逐字片段，非竞对已经做GEO的证明',
+      speech: 'competitorPressureEnabled控制；中上优先级、每通主动使用一次；具体问题与微信号码确认优先',
+      isolation: '客户资料变更淘汰旧revision；只在新通话生成快照，不修改活动通话' },
     note: '已有CRM的提取脚本尚未开发；导出后在本地导入。按规范化电话更新客户。',
   },
   voiceCore: {
