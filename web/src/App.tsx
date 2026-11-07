@@ -22,7 +22,7 @@ const pages: { id: Page; icon: Icon; label: string; description: string }[] = [
 ];
 const statusText: Record<SessionStatus, string> = { created: '等待连接', connecting: '连接中', opening: '开场播放中', active: '对话进行中', completed: '已结束', failed: '连接失败' };
 const emptyCustomer = { camp: '', name: '', phone: '', address: '', industry: '' };
-const demoCustomer = { camp: '石家庄示例机械设备有限公司', name: '王先生', phone: '13800000000', address: '河北省石家庄市', industry: '机械设备' };
+const demoCustomer = { camp: '石家庄矿安机械设备有限公司', name: '杨晓龙', phone: '13800000000', address: '河北省石家庄市', industry: '机械设备' };
 const activeStatus = (status?: SessionStatus) => Boolean(status && !['completed', 'failed'].includes(status));
 const dateText = (date: string) => new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(date));
 type PendingRecording = { sessionId: string; blob: Blob; mimeType: string; error: string };
@@ -368,7 +368,7 @@ export default function App() {
       const result = await api<{ customers: Customer[] }>('/customers/import', { customers: [demoCustomer] });
       setData(current => current ? { ...current, customers: result.customers } : current);
       setCustomerId(result.customers.find(customer => customer.phone === demoCustomer.phone)!.id);
-      setNotice('已带入虚构示例客户，可以直接试打。');
+      setNotice('已带入矿安机械测试资料，电话沿用测试号码，本地同行将自动查询。');
     } catch (reason) { setError(messageOf(reason)); }
     finally { setSaving(false); }
   }
